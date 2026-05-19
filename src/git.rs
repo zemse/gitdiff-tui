@@ -15,6 +15,25 @@ impl DiffSource {
             DiffSource::Branch { base, head } => format!("{base}..{head}"),
         }
     }
+
+    pub fn slug(&self) -> String {
+        match self {
+            DiffSource::WorkingTree => "working".to_string(),
+            DiffSource::Branch { base, head } => sanitize(&format!("{base}..{head}")),
+        }
+    }
+}
+
+fn sanitize(s: &str) -> String {
+    s.chars()
+        .map(|c| {
+            if c.is_alphanumeric() || c == '.' || c == '-' || c == '_' {
+                c
+            } else {
+                '_'
+            }
+        })
+        .collect()
 }
 
 pub fn repo_root() -> Result<PathBuf> {
@@ -105,32 +124,47 @@ fn resolve_base(root: &Path) -> Result<String> {
     }
 }
 
-pub fn get_diff(root: &Path, source: &DiffSource) -> Result<String> {
+#[derive(Debug, Clone, Copy)]
+pub struct DiffOpts {
+    pub ignore_whitespace: bool,
+    pub context_lines: usize,
+}
+
+impl Default for DiffOpts {
+    fn default() -> Self {
+        Self {
+            ignore_whitespace: false,
+            context_lines: 3,
+        }
+    }
+}
+
+pub fn get_diff(root: &Path, source: &DiffSource, opts: DiffOpts) -> Result<String> {
+    let ctx = format!("-U{}", opts.context_lines);
+    let mut base_args: Vec<&str> = vec![
+        "diff",
+        "--no-color",
+        "--no-ext-diff",
+        "--find-renames",
+        &ctx,
+    ];
+    if opts.ignore_whitespace {
+        base_args.push("-w");
+    }
     match source {
-        DiffSource::WorkingTree => run(
-            &[
-                "diff",
-                "HEAD",
-                "--no-color",
-                "--no-ext-diff",
-                "--find-renames",
-            ],
-            Some(root),
-        ),
+        DiffSource::WorkingTree => {
+            let mut args = base_args;
+            args.push("HEAD");
+            run(&args, Some(root))
+        }
         DiffSource::Branch { base, head } => {
             let merge_base = run(&["merge-base", base, head], Some(root))
                 .map(|s| s.trim().to_string())
                 .unwrap_or_else(|_| base.clone());
-            run(
-                &[
-                    "diff",
-                    &format!("{merge_base}..{head}"),
-                    "--no-color",
-                    "--no-ext-diff",
-                    "--find-renames",
-                ],
-                Some(root),
-            )
+            let range = format!("{merge_base}..{head}");
+            let mut args = base_args;
+            args.push(&range);
+            run(&args, Some(root))
         }
     }
 }

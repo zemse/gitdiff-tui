@@ -1,21 +1,53 @@
-use crate::app::Draft;
+use crate::app::{Draft, Verdict};
 use crate::git::DiffSource;
 use anyhow::{Context, Result};
 use chrono::Utc;
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashSet};
 use std::fs;
 use std::path::{Path, PathBuf};
 
-pub fn drafts_path(root: &Path) -> PathBuf {
-    root.join(".gitdiff").join("drafts.json")
+pub fn drafts_path(root: &Path, source: &DiffSource) -> PathBuf {
+    root.join(".gitdiff")
+        .join(format!("drafts-{}.json", source.slug()))
 }
 
-pub fn review_path(root: &Path) -> PathBuf {
-    root.join("REVIEW.md")
+pub fn viewed_path(root: &Path, source: &DiffSource) -> PathBuf {
+    root.join(".gitdiff")
+        .join(format!("viewed-{}.json", source.slug()))
 }
 
-pub fn load_drafts(root: &Path) -> Result<Vec<Draft>> {
-    let p = drafts_path(root);
+pub fn review_path(root: &Path, source: &DiffSource) -> PathBuf {
+    root.join(format!("REVIEW-{}.md", source.slug()))
+}
+
+pub fn load_viewed(root: &Path, source: &DiffSource) -> Result<HashSet<String>> {
+    let p = viewed_path(root, source);
+    if !p.exists() {
+        return Ok(HashSet::new());
+    }
+    let raw = fs::read_to_string(&p).with_context(|| format!("read {}", p.display()))?;
+    if raw.trim().is_empty() {
+        return Ok(HashSet::new());
+    }
+    let v: Vec<String> =
+        serde_json::from_str(&raw).with_context(|| format!("parse {}", p.display()))?;
+    Ok(v.into_iter().collect())
+}
+
+pub fn save_viewed(root: &Path, source: &DiffSource, viewed: &HashSet<String>) -> Result<()> {
+    let p = viewed_path(root, source);
+    if let Some(dir) = p.parent() {
+        fs::create_dir_all(dir)?;
+    }
+    let mut v: Vec<&String> = viewed.iter().collect();
+    v.sort();
+    fs::write(&p, serde_json::to_string_pretty(&v)?)
+        .with_context(|| format!("write {}", p.display()))?;
+    Ok(())
+}
+
+pub fn load_drafts(root: &Path, source: &DiffSource) -> Result<Vec<Draft>> {
+    let p = drafts_path(root, source);
     if !p.exists() {
         return Ok(Vec::new());
     }
@@ -26,8 +58,8 @@ pub fn load_drafts(root: &Path) -> Result<Vec<Draft>> {
     Ok(serde_json::from_str(&raw).with_context(|| format!("parse {}", p.display()))?)
 }
 
-pub fn save_drafts(root: &Path, drafts: &[Draft]) -> Result<()> {
-    let p = drafts_path(root);
+pub fn save_drafts(root: &Path, source: &DiffSource, drafts: &[Draft]) -> Result<()> {
+    let p = drafts_path(root, source);
     if let Some(dir) = p.parent() {
         fs::create_dir_all(dir)?;
     }
@@ -43,8 +75,9 @@ pub fn write_review(
     base_sha: Option<&str>,
     head_sha: Option<&str>,
     drafts: &[Draft],
+    verdict: Verdict,
 ) -> Result<PathBuf> {
-    let p = review_path(root);
+    let p = review_path(root, source);
     let mut out = String::new();
     out.push_str("# Code Review\n\n");
     out.push_str(&format!(
@@ -55,10 +88,13 @@ pub fn write_review(
     if let (Some(b), Some(h)) = (base_sha, head_sha) {
         out.push_str(&format!("Range: {b} .. {h}\n"));
     }
-    let _ = source; // reserved for future use (per-source phrasing)
+    out.push_str(&format!("Verdict: {}\n", verdict.label()));
+    let _ = source;
+    let open = drafts.iter().filter(|d| !d.resolved).count();
+    let resolved = drafts.len() - open;
+    let outdated = drafts.iter().filter(|d| d.outdated).count();
     out.push_str(&format!(
-        "Status: {} open · 0 resolved\n\n---\n\n",
-        drafts.len()
+        "Status: {open} open · {resolved} resolved · {outdated} outdated\n\n---\n\n"
     ));
 
     if drafts.is_empty() {
@@ -67,20 +103,35 @@ pub fn write_review(
         return Ok(p);
     }
 
-    // group by file, preserve insertion order via BTreeMap of Vec
-    let mut by_file: BTreeMap<String, Vec<&Draft>> = BTreeMap::new();
-    for d in drafts {
-        by_file.entry(d.file_path.clone()).or_default().push(d);
+    write_section(&mut out, "Open", drafts.iter().filter(|d| !d.resolved));
+    if resolved > 0 {
+        out.push_str("---\n\n# Resolved\n\n");
+        write_section(&mut out, "Resolved", drafts.iter().filter(|d| d.resolved));
     }
 
+    fs::write(&p, out).with_context(|| format!("write {}", p.display()))?;
+    Ok(p)
+}
+
+fn write_section<'a>(out: &mut String, _label: &str, ds: impl Iterator<Item = &'a Draft>) {
+    let mut by_file: BTreeMap<String, Vec<&Draft>> = BTreeMap::new();
+    for d in ds {
+        by_file.entry(d.file_path.clone()).or_default().push(d);
+    }
     for (file, mut entries) in by_file {
         entries.sort_by_key(|d| d.new_lineno.unwrap_or(d.old_lineno.unwrap_or(0)));
         out.push_str(&format!("## {file}\n\n"));
         for d in entries {
             let anchor = d.anchor_label();
-            out.push_str(&format!("### {anchor} · open\n\n"));
-            out.push_str("Original:\n\n");
-            out.push_str("```diff\n");
+            let status = if d.resolved {
+                "resolved"
+            } else if d.outdated {
+                "open · outdated"
+            } else {
+                "open"
+            };
+            out.push_str(&format!("### {anchor} · {status}\n\n"));
+            out.push_str("Original:\n\n```diff\n");
             out.push_str(&d.diff_snippet);
             if !d.diff_snippet.ends_with('\n') {
                 out.push('\n');
@@ -95,10 +146,10 @@ pub fn write_review(
                 out.push_str(line);
                 out.push('\n');
             }
+            if !d.reactions.is_empty() {
+                out.push_str(&format!("\nReactions: {}\n", d.reactions.join(" ")));
+            }
             out.push_str("\n---\n\n");
         }
     }
-
-    fs::write(&p, out).with_context(|| format!("write {}", p.display()))?;
-    Ok(p)
 }
