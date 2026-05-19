@@ -23,8 +23,16 @@ pub fn repo_root() -> Result<PathBuf> {
 }
 
 pub fn has_working_changes(root: &Path) -> Result<bool> {
-    let out = run(&["status", "--porcelain"], Some(root))?;
-    Ok(out.lines().any(|l| !l.is_empty()))
+    let mut cmd = Command::new("git");
+    cmd.args(["diff", "HEAD", "--quiet"]).current_dir(root);
+    let status = cmd
+        .status()
+        .with_context(|| "failed to invoke `git diff HEAD --quiet`")?;
+    match status.code() {
+        Some(0) => Ok(false),
+        Some(1) => Ok(true),
+        _ => Err(anyhow!("git diff HEAD --quiet exited unexpectedly")),
+    }
 }
 
 pub fn detect_source(root: &Path, override_range: Option<String>) -> Result<DiffSource> {
@@ -50,21 +58,51 @@ fn parse_range(s: &str) -> Result<(String, String)> {
     }
 }
 
+fn current_branch(root: &Path) -> Option<String> {
+    let out = run(&["rev-parse", "--abbrev-ref", "HEAD"], Some(root)).ok()?;
+    let name = out.trim().to_string();
+    if name.is_empty() || name == "HEAD" {
+        None
+    } else {
+        Some(name)
+    }
+}
+
 fn resolve_base(root: &Path) -> Result<String> {
+    let current = current_branch(root);
+    let on_trunk = matches!(current.as_deref(), Some("main") | Some("master"));
+
+    // Non-trunk branches: behave like a PR — base is main/master, not @{upstream}.
+    // (an @{upstream} like origin/feature would diff the branch against itself)
+    if !on_trunk {
+        for candidate in ["origin/main", "origin/master", "main", "master"] {
+            if Some(candidate) == current.as_deref() {
+                continue;
+            }
+            if run(&["rev-parse", "--verify", candidate], Some(root)).is_ok() {
+                return Ok(candidate.to_string());
+            }
+        }
+    }
+
+    // Trunk (or no main/master nearby): fall back to @{upstream} for unpushed commits.
     if let Ok(out) = run(&["rev-parse", "--abbrev-ref", "@{upstream}"], Some(root)) {
-        let trimmed = out.trim();
-        if !trimmed.is_empty() {
-            return Ok(trimmed.to_string());
+        let t = out.trim();
+        if !t.is_empty() && Some(t) != current.as_deref() {
+            return Ok(t.to_string());
         }
     }
-    for candidate in ["origin/main", "origin/master", "main", "master"] {
-        if run(&["rev-parse", "--verify", candidate], Some(root)).is_ok() {
-            return Ok(candidate.to_string());
-        }
+
+    let branch = current.as_deref().unwrap_or("HEAD");
+    if on_trunk {
+        Err(anyhow!(
+            "nothing to review: on '{branch}' with no @{{upstream}} and no working changes — commit on a feature branch first, or pass <base>..<head>"
+        ))
+    } else {
+        Err(anyhow!(
+            "nothing to diff against: on '{branch}', but no main/master or @{{upstream}} found — pass <base>..<head> explicitly"
+        ))
     }
-    Err(anyhow!(
-        "no upstream branch found; pass an explicit <base>..<head> arg"
-    ))
 }
 
 pub fn get_diff(root: &Path, source: &DiffSource) -> Result<String> {
