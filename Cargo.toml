@@ -1,7 +1,20 @@
 [package]
-name = "gitdiff"
+name = "gitdiff-tui"
 version = "0.1.0"
 edition = "2024"
+description = "TUI for reviewing local git changes like a GitHub PR — leave inline comments that get written to REVIEW.md for an agent or another human to act on."
+license = "MIT"
+repository = "https://github.com/zemse/gitdiff-tui"
+homepage = "https://github.com/zemse/gitdiff-tui"
+readme = "README.md"
+keywords = ["git", "diff", "tui", "review", "ratatui"]
+categories = ["command-line-utilities", "development-tools"]
+authors = ["Soham Zemse <sohamzemse143@gmail.com>"]
+exclude = ["docs/*", "PLAN.md", "target/*"]
+
+[[bin]]
+name = "gitdiff"
+path = "src/main.rs"
 
 [dependencies]
 ratatui = "0.29"
