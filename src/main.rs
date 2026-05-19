@@ -39,6 +39,7 @@ fn main() -> Result<()> {
     let mut state = AppState::new(source.clone(), source_label, files, drafts, viewed);
     state.opts = opts;
     state.mark_outdated_drafts();
+    prefetch_file_blobs(&mut state, &root);
 
     let (base_sha, head_sha) = match &source {
         git::DiffSource::Branch { base, head } => {
@@ -98,15 +99,39 @@ fn run_loop<B: ratatui::backend::Backend>(
             continue;
         }
         let ev = event::read()?;
+        // Ctrl-C exits unconditionally, regardless of current mode. We catch
+        // it here so the composer's TextArea doesn't swallow it as input.
+        if let Event::Key(k) = &ev {
+            if k.kind == KeyEventKind::Press
+                && k.modifiers.contains(KeyModifiers::CONTROL)
+                && k.code == KeyCode::Char('c')
+            {
+                state.should_quit = true;
+                return Ok(());
+            }
+        }
         match state.mode {
             Mode::Normal => {
                 if let Event::Mouse(m) = ev {
-                    handle_mouse(state, m, &mut composer);
+                    handle_mouse(state, m, &mut composer, root);
                 } else {
                     handle_normal(state, &ev, root, base_sha, head_sha, &mut composer)?;
                 }
             }
-            Mode::Composing => handle_composing(state, &ev, &mut composer),
+            Mode::Composing => {
+                if let Event::Mouse(m) = ev {
+                    // let scroll-wheel still pan the diff under the composer;
+                    // click/drag should not interact with the diff while
+                    // composing, so we drop them.
+                    match m.kind {
+                        MouseEventKind::ScrollDown => state.scroll_by(3),
+                        MouseEventKind::ScrollUp => state.scroll_by(-3),
+                        _ => {}
+                    }
+                } else {
+                    handle_composing(state, &ev, &mut composer);
+                }
+            }
             Mode::Help => {
                 if matches!(ev, Event::Key(_) | Event::Mouse(_)) {
                     state.mode = Mode::Normal;
@@ -124,7 +149,19 @@ fn reload_diff(state: &mut AppState, root: &std::path::Path) -> Result<()> {
     let raw = git::get_diff(root, &state.source, state.opts)?;
     let files = diff::parse(&raw)?;
     state.replace_files(files);
+    prefetch_file_blobs(state, root);
     Ok(())
+}
+
+fn prefetch_file_blobs(state: &mut AppState, root: &std::path::Path) {
+    let paths: Vec<String> = state.files.iter().map(|f| f.path.clone()).collect();
+    for path in paths {
+        if !state.file_blobs.contains_key(&path) {
+            let blob = git::read_file_lines(root, &state.source, &path);
+            state.set_file_blob(path, blob);
+        }
+    }
+    state.rebuild_flat();
 }
 
 fn handle_normal(
@@ -142,8 +179,25 @@ fn handle_normal(
     state.status = None;
     let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
     let half = (state.viewport_height / 2).max(1) as i32;
+    // Any keyboard navigation reveals the cursor.
+    let nav_keys = matches!(
+        key.code,
+        KeyCode::Char('j' | 'k' | 'g' | 'G' | ']' | '[' | '}' | '{')
+            | KeyCode::Up
+            | KeyCode::Down
+            | KeyCode::PageUp
+            | KeyCode::PageDown
+    ) || (ctrl && matches!(key.code, KeyCode::Char('d' | 'u')));
+    if nav_keys {
+        state.cursor_visible = true;
+    }
 
     match key.code {
+        KeyCode::Esc => {
+            state.cursor_visible = false;
+            state.clear_selection();
+            state.status = None;
+        }
         KeyCode::Char('q') => state.should_quit = true,
         KeyCode::Char('j') | KeyCode::Down => state.move_cursor(1),
         KeyCode::Char('k') | KeyCode::Up => state.move_cursor(-1),
@@ -165,8 +219,14 @@ fn handle_normal(
         KeyCode::Char('{') => state.jump_prev_hunk(),
         KeyCode::Char('?') => state.mode = Mode::Help,
         KeyCode::Char(' ') => {
-            if let Some(fl) = state.flat.get(state.cursor) {
-                state.toggle_collapse(fl.file_idx);
+            if let Some(fl) = state.flat.get(state.cursor).cloned() {
+                if fl.kind == FlatKind::HunkHeader {
+                    if let Some(hi) = fl.hunk_idx {
+                        state.toggle_hunk_collapse(fl.file_idx, hi);
+                    }
+                } else {
+                    state.toggle_collapse(fl.file_idx);
+                }
             }
         }
         KeyCode::Char('z') => state.collapse_all(true),
@@ -216,6 +276,22 @@ fn handle_normal(
             state.opts.context_lines = next;
             reload_diff(state, root)?;
             state.status = Some(format!("context: {}", state.opts.context_lines));
+        }
+        KeyCode::Char('<') => {
+            if let Some(fl) = state.flat.get(state.cursor).cloned() {
+                if let Some(hi) = fl.hunk_idx {
+                    let n = run_expand(state, root, fl.file_idx, hi, 20, true);
+                    state.status = Some(format!("expanded {n} lines above"));
+                }
+            }
+        }
+        KeyCode::Char('>') => {
+            if let Some(fl) = state.flat.get(state.cursor).cloned() {
+                if let Some(hi) = fl.hunk_idx {
+                    let n = run_expand(state, root, fl.file_idx, hi, 20, false);
+                    state.status = Some(format!("expanded {n} lines below"));
+                }
+            }
         }
         KeyCode::Char(',') => {
             state.tab_width = state.tab_width.saturating_sub(1).max(1);
@@ -310,6 +386,7 @@ fn handle_mouse(
     state: &mut AppState,
     m: MouseEvent,
     composer: &mut Option<TextArea<'static>>,
+    root: &std::path::Path,
 ) {
     // If the click is in the left sidebar (tree) or right (drafts), dispatch there.
     if state.show_tree && m.column < state.body_x {
@@ -339,10 +416,57 @@ fn handle_mouse(
             let Some(idx) = row_to_idx(m.row) else { return };
             let fl = state.flat[idx].clone();
             match fl.kind {
-                FlatKind::FileHeader | FlatKind::FileFooter => {
+                FlatKind::FileHeader => {
+                    state.cursor = idx;
+                    state.clear_selection();
+                    // Right-aligned " ✓ viewed " / " ☐ viewed " badge is 10
+                    // chars wide; the closing `╮` is the very last column.
+                    let rel_col = m.column.saturating_sub(state.body_x);
+                    let badge_start = state.body_width.saturating_sub(11);
+                    let badge_end = state.body_width.saturating_sub(1);
+                    if rel_col >= badge_start && rel_col < badge_end {
+                        if let Some(now) = state.toggle_viewed(fl.file_idx) {
+                            state.status = Some(if now {
+                                "marked viewed (collapsed)".into()
+                            } else {
+                                "marked unviewed".into()
+                            });
+                        }
+                    } else {
+                        state.toggle_collapse(fl.file_idx);
+                    }
+                }
+                FlatKind::FileFooter => {
                     state.cursor = idx;
                     state.clear_selection();
                     state.toggle_collapse(fl.file_idx);
+                }
+                FlatKind::HunkHeader => {
+                    state.cursor = idx;
+                    state.clear_selection();
+                    if let Some(hi) = fl.hunk_idx {
+                        state.toggle_hunk_collapse(fl.file_idx, hi);
+                    }
+                }
+                FlatKind::DraftRow => {
+                    state.cursor = idx;
+                    state.clear_selection();
+                    if let Some(di) = fl.draft_idx {
+                        edit_draft(state, di, composer);
+                    }
+                }
+                FlatKind::ExpandBtnAbove | FlatKind::ExpandBtnBelow => {
+                    state.cursor = idx;
+                    state.clear_selection();
+                    let above = fl.kind == FlatKind::ExpandBtnAbove;
+                    let count = fl.line_idx.unwrap_or(20);
+                    if let Some(hi) = fl.hunk_idx {
+                        let n = run_expand(state, root, fl.file_idx, hi, count, above);
+                        state.status = Some(format!(
+                            "expanded {n} lines {}",
+                            if above { "above" } else { "below" }
+                        ));
+                    }
                 }
                 FlatKind::Code => {
                     state.start_selection(idx);
@@ -370,6 +494,27 @@ fn handle_mouse(
         }
         _ => {}
     }
+}
+
+fn run_expand(
+    state: &mut AppState,
+    root: &std::path::Path,
+    fi: usize,
+    hi: usize,
+    count: usize,
+    above: bool,
+) -> usize {
+    // ensure the file blob is cached so expand_hunk knows the file length
+    let path = state.files[fi].path.clone();
+    if !state.file_blobs.contains_key(&path) {
+        let blob = git::read_file_lines(root, &state.source, &path);
+        state.set_file_blob(path.clone(), blob);
+    }
+    let lines = match state.file_blobs.get(&path).and_then(|b| b.as_ref()) {
+        Some(v) => v.clone(),
+        None => Vec::new(),
+    };
+    state.expand_hunk(fi, hi, &lines, count, above)
 }
 
 fn handle_tree_mouse(state: &mut AppState, m: MouseEvent) {
@@ -471,20 +616,89 @@ fn handle_picker(state: &mut AppState, ev: &Event) {
     }
 }
 
+fn edit_draft(
+    state: &mut AppState,
+    draft_idx: usize,
+    composer: &mut Option<TextArea<'static>>,
+) -> bool {
+    let d = match state.drafts.get(draft_idx) {
+        Some(d) => d.clone(),
+        None => return false,
+    };
+    let Some(fi) = state.files.iter().position(|f| f.path == d.file_path) else {
+        return false;
+    };
+    let target = state.flat.iter().position(|fl| {
+        if fl.kind != FlatKind::Code || fl.file_idx != fi {
+            return false;
+        }
+        let Some(hi) = fl.hunk_idx else { return false };
+        let Some(li) = fl.line_idx else { return false };
+        let Some(line) = state.files[fi].hunks.get(hi).and_then(|h| h.lines.get(li)) else {
+            return false;
+        };
+        line.old_lineno == d.old_lineno && line.new_lineno == d.new_lineno
+    });
+    let Some(anchor_idx) = target else { return false };
+    state.start_selection(anchor_idx);
+    state.finish_selection();
+    open_composer(state, composer);
+    true
+}
+
 fn open_composer(state: &mut AppState, composer: &mut Option<TextArea<'static>>) {
     let existing = state.existing_draft_body_for_selection();
+    let edit_idx = state.draft_for_selection();
     let mut ta = TextArea::default();
-    if let Some(b) = existing {
-        let lines: Vec<&str> = b.lines().collect();
+    let initial_lines = if let Some(b) = existing {
+        let lines: Vec<String> = b.lines().map(|s| s.to_string()).collect();
         for (i, line) in lines.iter().enumerate() {
             ta.insert_str(line);
             if i + 1 < lines.len() {
                 ta.insert_newline();
             }
         }
-    }
+        lines.len().max(1)
+    } else {
+        1
+    };
     *composer = Some(ta);
     state.mode = Mode::Composing;
+    // Hide the draft being edited so the composer replaces (not duplicates) it.
+    if edit_idx.is_some() {
+        state.editing_draft_idx = edit_idx;
+        state.rebuild_flat();
+    }
+    // Seed composer_height with the body's natural size so the gap computed on
+    // this frame (before ui::draw runs again) already fits the content.
+    let h = (initial_lines as u16)
+        .saturating_add(2)
+        .max(ui::COMPOSER_MIN_H);
+    state.composer_height = h;
+    // Scroll so both the selection and the inserted composer-gap fit in view.
+    // Gap occupies rows [end+1, end+1+H) in extended coords.
+    if let Some(sel) = state.selection {
+        let (a, b) = sel.range();
+        let composer_h = state.composer_height as usize;
+        let needed_scroll_floor = (b + 1 + composer_h).saturating_sub(state.viewport_height);
+        // keep selection start visible at the top
+        let target = needed_scroll_floor.min(a);
+        if state.scroll < target {
+            state.scroll = target;
+        }
+    }
+}
+
+fn close_composer(state: &mut AppState, composer: &mut Option<TextArea<'static>>) {
+    *composer = None;
+    state.mode = Mode::Normal;
+    state.composer_height = 0;
+    state.editing_draft_idx = None;
+    state.clear_selection();
+    state.cursor_visible = false;
+    // Always rebuild so a newly-saved (or just-edited) draft renders on the
+    // next frame without waiting for an unrelated trigger.
+    state.rebuild_flat();
 }
 
 fn handle_composing(state: &mut AppState, ev: &Event, composer: &mut Option<TextArea<'static>>) {
@@ -496,9 +710,7 @@ fn handle_composing(state: &mut AppState, ev: &Event, composer: &mut Option<Text
 
     match key.code {
         KeyCode::Esc => {
-            *composer = None;
-            state.mode = Mode::Normal;
-            state.clear_selection();
+            close_composer(state, composer);
             state.status = Some("comment cancelled".into());
         }
         KeyCode::Char('s') if ctrl => {
@@ -513,9 +725,7 @@ fn handle_composing(state: &mut AppState, ev: &Event, composer: &mut Option<Text
             } else if state.add_draft_from_selection(body).is_some() {
                 state.status = Some("draft saved (press S to submit to REVIEW.md)".into());
             }
-            *composer = None;
-            state.mode = Mode::Normal;
-            state.clear_selection();
+            close_composer(state, composer);
         }
         _ => {
             if let Some(ta) = composer {

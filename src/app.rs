@@ -11,6 +11,14 @@ pub enum FlatKind {
     FileFooter,
     HunkHeader,
     Code,
+    ExpandedAbove,
+    ExpandedBelow,
+    ExpandBtnAbove,
+    ExpandBtnBelow,
+    // Inline rendering of a draft anchored to the Code row above. `line_idx`
+    // selects which sub-row of the draft is being rendered (0 = header,
+    // 1..N = body lines, N+1 = reactions if any).
+    DraftRow,
     Spacer,
 }
 
@@ -20,6 +28,7 @@ pub struct FlatLine {
     pub file_idx: usize,
     pub hunk_idx: Option<usize>,
     pub line_idx: Option<usize>,
+    pub draft_idx: Option<usize>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -114,6 +123,12 @@ impl Verdict {
 
 pub type LineKey = (usize, usize, usize); // (file_idx, hunk_idx, line_idx)
 
+#[derive(Debug, Default, Clone)]
+pub struct Expansion {
+    pub above: Vec<DiffLine>,
+    pub below: Vec<DiffLine>,
+}
+
 #[derive(Debug, Clone, Copy)]
 pub struct IntraRange {
     pub prefix: usize,
@@ -137,7 +152,14 @@ pub struct AppState {
     pub total_deletions: usize,
     pub highlights: HashMap<LineKey, Vec<HSpan>>,
     pub intraline: HashMap<LineKey, IntraRange>,
+    pub expansions: HashMap<(usize, usize), Expansion>,
+    // Cached file content for expand-context (loaded lazily on first click).
+    // None → fetch failed / unavailable. Some → use lines.len() as max bound.
+    pub file_blobs: HashMap<String, Option<Vec<String>>>,
+    // Hunks the user has explicitly folded (only the `@@` header visible).
+    pub collapsed_hunks: HashSet<(usize, usize)>,
     pub selection: Option<Selection>,
+    pub cursor_visible: bool,
     pub body_top: u16,
     pub viewed: HashSet<String>,
     pub show_tree: bool,
@@ -149,6 +171,13 @@ pub struct AppState {
     pub picker: Option<FuzzyPicker>,
     pub body_x: u16,
     pub body_width: u16,
+    // Dynamic composer popup height (rows, includes borders). Set by ui::draw
+    // each frame based on the TextArea's content. 0 when not composing.
+    pub composer_height: u16,
+    // Index of the draft currently being edited in the composer. When Some,
+    // rebuild_flat hides that draft's rows so the composer replaces (not
+    // duplicates) the rendered comment.
+    pub editing_draft_idx: Option<usize>,
 }
 
 #[derive(Debug, Clone)]
@@ -167,7 +196,7 @@ impl AppState {
     ) -> Self {
         // viewed files start collapsed
         let expanded: Vec<bool> = files.iter().map(|f| !viewed.contains(&f.path)).collect();
-        let flat = flatten(&files, &expanded);
+        let flat = flatten(&files, &expanded, &HashMap::new());
         let total_additions = files.iter().map(|f| f.additions).sum();
         let total_deletions = files.iter().map(|f| f.deletions).sum();
         let highlights = precompute_highlights(&files);
@@ -189,7 +218,11 @@ impl AppState {
             total_deletions,
             highlights,
             intraline,
+            expansions: HashMap::new(),
+            file_blobs: HashMap::new(),
+            collapsed_hunks: HashSet::new(),
             selection: None,
+            cursor_visible: false,
             body_top: 1,
             viewed,
             show_tree: false,
@@ -201,6 +234,8 @@ impl AppState {
             picker: None,
             body_x: 0,
             body_width: 80,
+            composer_height: 0,
+            editing_draft_idx: None,
         };
         // start on first code line if possible
         if let Some(i) = s.flat.iter().position(|l| l.kind == FlatKind::Code) {
@@ -209,13 +244,219 @@ impl AppState {
         s
     }
 
+    pub fn rebuild_flat(&mut self) {
+        let mut out = Vec::new();
+        for fi in 0..self.files.len() {
+            out.push(FlatLine {
+                kind: FlatKind::FileHeader,
+                file_idx: fi,
+                hunk_idx: None,
+                line_idx: None,
+                        draft_idx: None,
+            });
+            if self.expanded.get(fi).copied().unwrap_or(true) {
+                for hi in 0..self.files[fi].hunks.len() {
+                    // -- above button --
+                    // Skip the above-button if THIS hunk is collapsed (the
+                    // user has folded it; no need to offer expanding context
+                    // around something they explicitly hid).
+                    let hunk_collapsed = self.collapsed_hunks.contains(&(fi, hi));
+                    let rem_above = if hunk_collapsed { 0 } else { self.remaining_above(fi, hi) };
+                    let emit_above_btn = if hi == 0 {
+                        rem_above > 0
+                    } else {
+                        let prev_rem = if self.collapsed_hunks.contains(&(fi, hi - 1)) {
+                            0
+                        } else {
+                            self.remaining_below(fi, hi - 1, 0)
+                        };
+                        let combined = prev_rem + rem_above;
+                        combined > 20 && rem_above > 0
+                    };
+                    if emit_above_btn {
+                        let count = 20.min(rem_above);
+                        out.push(FlatLine {
+                            kind: FlatKind::ExpandBtnAbove,
+                            file_idx: fi,
+                            hunk_idx: Some(hi),
+                            line_idx: Some(count),
+                        draft_idx: None,
+                        });
+                    }
+
+                    // -- hunk header (always FIRST inside the hunk's region,
+                    //    matching GitHub's layout: `@@` at the top, then any
+                    //    expanded-above context, then the code) --
+                    out.push(FlatLine {
+                        kind: FlatKind::HunkHeader,
+                        file_idx: fi,
+                        hunk_idx: Some(hi),
+                        line_idx: None,
+                        draft_idx: None,
+                    });
+
+                    // If this hunk is collapsed, skip the rest of its rows
+                    // (expanded context, code, expanded-below, below button).
+                    if self.collapsed_hunks.contains(&(fi, hi)) {
+                        continue;
+                    }
+
+                    // -- expanded-above context (below the @@ header, above the
+                    //    actual change region) --
+                    if let Some(exp) = self.expansions.get(&(fi, hi)) {
+                        for li in 0..exp.above.len() {
+                            out.push(FlatLine {
+                                kind: FlatKind::ExpandedAbove,
+                                file_idx: fi,
+                                hunk_idx: Some(hi),
+                                line_idx: Some(li),
+                        draft_idx: None,
+                            });
+                        }
+                    }
+
+                    // -- code (with inline drafts attached) --
+                    for li in 0..self.files[fi].hunks[hi].lines.len() {
+                        out.push(FlatLine {
+                            kind: FlatKind::Code,
+                            file_idx: fi,
+                            hunk_idx: Some(hi),
+                            line_idx: Some(li),
+                            draft_idx: None,
+                        });
+                        // emit any drafts anchored at this code line, inline
+                        let line = &self.files[fi].hunks[hi].lines[li];
+                        let drafts_here: Vec<usize> = self
+                            .drafts
+                            .iter()
+                            .enumerate()
+                            .filter(|(_, d)| {
+                                d.file_path == self.files[fi].path
+                                    && d.old_lineno == line.old_lineno
+                                    && d.new_lineno == line.new_lineno
+                            })
+                            .map(|(i, _)| i)
+                            .collect();
+                        for di in drafts_here {
+                            // Skip the draft currently being edited — the composer
+                            // popup renders in its place.
+                            if self.editing_draft_idx == Some(di) {
+                                continue;
+                            }
+                            let body_lines = self.drafts[di].body.lines().count().max(1);
+                            let has_react = !self.drafts[di].reactions.is_empty();
+                            // 2 border rows (top + bottom) + body + optional reactions.
+                            let total_rows = 2 + body_lines + if has_react { 1 } else { 0 };
+                            for sub in 0..total_rows {
+                                out.push(FlatLine {
+                                    kind: FlatKind::DraftRow,
+                                    file_idx: fi,
+                                    hunk_idx: Some(hi),
+                                    line_idx: Some(sub),
+                                    draft_idx: Some(di),
+                                });
+                            }
+                        }
+                    }
+
+                    // -- expanded-below context --
+                    if let Some(exp) = self.expansions.get(&(fi, hi)) {
+                        for li in 0..exp.below.len() {
+                            out.push(FlatLine {
+                                kind: FlatKind::ExpandedBelow,
+                                file_idx: fi,
+                                hunk_idx: Some(hi),
+                                line_idx: Some(li),
+                        draft_idx: None,
+                            });
+                        }
+                    }
+
+                    // -- below button --
+                    // count_hint=0 so we don't show the button when the
+                    // file blob can't be fetched (deleted file, binary, etc.)
+                    let rem_below = self.remaining_below(fi, hi, 0);
+                    let is_last = hi + 1 >= self.files[fi].hunks.len();
+                    let next_above_rem = if is_last {
+                        0
+                    } else {
+                        self.remaining_above(fi, hi + 1)
+                    };
+                    if is_last {
+                        if rem_below > 0 {
+                            let count = 20.min(rem_below);
+                            out.push(FlatLine {
+                                kind: FlatKind::ExpandBtnBelow,
+                                file_idx: fi,
+                                hunk_idx: Some(hi),
+                                line_idx: Some(count),
+                        draft_idx: None,
+                            });
+                        }
+                    } else {
+                        let combined = rem_below + next_above_rem;
+                        if combined == 0 {
+                            // gap fully closed
+                        } else if combined <= 20 {
+                            // merged button: load the entire remaining gap
+                            // into THIS hunk's below
+                            out.push(FlatLine {
+                                kind: FlatKind::ExpandBtnBelow,
+                                file_idx: fi,
+                                hunk_idx: Some(hi),
+                                line_idx: Some(combined),
+                        draft_idx: None,
+                            });
+                        } else if rem_below > 0 {
+                            let count = 20.min(rem_below);
+                            out.push(FlatLine {
+                                kind: FlatKind::ExpandBtnBelow,
+                                file_idx: fi,
+                                hunk_idx: Some(hi),
+                                line_idx: Some(count),
+                        draft_idx: None,
+                            });
+                        }
+                    }
+                }
+            }
+            out.push(FlatLine {
+                kind: FlatKind::FileFooter,
+                file_idx: fi,
+                hunk_idx: None,
+                line_idx: None,
+                        draft_idx: None,
+            });
+            out.push(FlatLine {
+                kind: FlatKind::Spacer,
+                file_idx: fi,
+                hunk_idx: None,
+                line_idx: None,
+                        draft_idx: None,
+            });
+        }
+        self.flat = out;
+    }
+
+    pub fn toggle_hunk_collapse(&mut self, fi: usize, hi: usize) {
+        let key = (fi, hi);
+        if self.collapsed_hunks.contains(&key) {
+            self.collapsed_hunks.remove(&key);
+        } else {
+            self.collapsed_hunks.insert(key);
+        }
+        self.rebuild_flat();
+        self.cursor = self.cursor.min(self.flat.len().saturating_sub(1));
+        self.ensure_cursor_visible();
+    }
+
     pub fn toggle_collapse(&mut self, file_idx: usize) {
         if file_idx >= self.expanded.len() {
             return;
         }
         let cursor_file = self.flat.get(self.cursor).map(|fl| fl.file_idx);
         self.expanded[file_idx] = !self.expanded[file_idx];
-        self.flat = flatten(&self.files, &self.expanded);
+        self.rebuild_flat();
         // try to keep cursor in the same file's header after rebuild
         if let Some(fi) = cursor_file {
             if let Some(i) = self.flat.iter().position(|fl| {
@@ -231,7 +472,7 @@ impl AppState {
         for e in self.expanded.iter_mut() {
             *e = !collapsed;
         }
-        self.flat = flatten(&self.files, &self.expanded);
+        self.rebuild_flat();
         self.cursor = self.cursor.min(self.flat.len().saturating_sub(1));
         self.ensure_cursor_visible();
     }
@@ -249,7 +490,7 @@ impl AppState {
         if let Some(e) = self.expanded.get_mut(file_idx) {
             *e = !now_viewed; // viewed → collapsed
         }
-        self.flat = flatten(&self.files, &self.expanded);
+        self.rebuild_flat();
         self.cursor = self.cursor.min(self.flat.len().saturating_sub(1));
         self.ensure_cursor_visible();
         Some(now_viewed)
@@ -262,6 +503,190 @@ impl AppState {
             .count()
     }
 
+    /// Cache a file's content for accurate expansion bounds. Called lazily by
+    /// the click handler before invoking expand_hunk.
+    pub fn set_file_blob(&mut self, path: String, blob: Option<Vec<String>>) {
+        self.file_blobs.insert(path, blob);
+    }
+
+    fn file_max_new_lineno(&self, fi: usize) -> Option<usize> {
+        let path = self.files.get(fi)?.path.clone();
+        self.file_blobs.get(&path).and_then(|b| b.as_ref()).map(|v| v.len())
+    }
+
+    fn above_frontier_new(&self, fi: usize, hi: usize) -> usize {
+        self.expansions
+            .get(&(fi, hi))
+            .and_then(|e| e.above.first())
+            .and_then(|l| l.new_lineno)
+            .unwrap_or_else(|| self.files[fi].hunks[hi].new_start)
+    }
+
+    fn below_frontier_new(&self, fi: usize, hi: usize) -> usize {
+        self.expansions
+            .get(&(fi, hi))
+            .and_then(|e| e.below.last())
+            .and_then(|l| l.new_lineno)
+            .unwrap_or_else(|| {
+                let h = &self.files[fi].hunks[hi];
+                h.new_start + h.new_count - 1
+            })
+    }
+
+    /// Lower (smaller new_lineno) boundary for hunk `hi`'s "expand above" zone.
+    fn above_lower_bound_new(&self, fi: usize, hi: usize) -> usize {
+        if hi == 0 {
+            1
+        } else {
+            // previous hunk's last covered line + 1
+            let prev_below_frontier = self.below_frontier_new(fi, hi - 1);
+            prev_below_frontier + 1
+        }
+    }
+
+    /// Upper (larger new_lineno) boundary for hunk `hi`'s "expand below" zone.
+    /// Returns None if we don't yet know the file's total length (no blob cached
+    /// and this is the last hunk).
+    fn below_upper_bound_new(&self, fi: usize, hi: usize) -> Option<usize> {
+        let file = self.files.get(fi)?;
+        if hi + 1 < file.hunks.len() {
+            let next_above_frontier = self.above_frontier_new(fi, hi + 1);
+            Some(next_above_frontier.saturating_sub(1))
+        } else {
+            self.file_max_new_lineno(fi)
+        }
+    }
+
+    /// Number of lines that COULD still be loaded above hunk `hi`.
+    pub fn remaining_above(&self, fi: usize, hi: usize) -> usize {
+        self.above_frontier_new(fi, hi)
+            .saturating_sub(self.above_lower_bound_new(fi, hi))
+    }
+
+    /// Number of lines that COULD still be loaded below hunk `hi`. Returns
+    /// `count_hint` (20) when the file length isn't known yet — conservative
+    /// optimistic estimate; the actual expansion is bounded later.
+    pub fn remaining_below(&self, fi: usize, hi: usize, count_hint: usize) -> usize {
+        match self.below_upper_bound_new(fi, hi) {
+            Some(upper) => upper.saturating_sub(self.below_frontier_new(fi, hi)),
+            None => count_hint, // unknown — show button optimistically
+        }
+    }
+
+    /// Combined gap remaining between hunk `hi` and the next hunk. Returns None
+    /// if `hi` is the last hunk in the file.
+    pub fn inter_hunk_remaining(&self, fi: usize, hi: usize) -> Option<usize> {
+        let file = self.files.get(fi)?;
+        if hi + 1 >= file.hunks.len() {
+            return None;
+        }
+        let lower = self.below_frontier_new(fi, hi);
+        let upper = self.above_frontier_new(fi, hi + 1);
+        Some(upper.saturating_sub(lower + 1))
+    }
+
+    /// Expand hunk `hi` in the given direction by up to `count` lines, sourced
+    /// from `lines` (new-side file content). Returns the number actually added.
+    pub fn expand_hunk(
+        &mut self,
+        fi: usize,
+        hi: usize,
+        lines: &[String],
+        count: usize,
+        above: bool,
+    ) -> usize {
+        let Some(_) = self.files.get(fi) else { return 0 };
+        if hi >= self.files[fi].hunks.len() {
+            return 0;
+        }
+        let added = if above {
+            let frontier_new = self.above_frontier_new(fi, hi);
+            let lower_bound_new = self.above_lower_bound_new(fi, hi);
+            let available = frontier_new.saturating_sub(lower_bound_new);
+            let added = count.min(available);
+            if added == 0 {
+                return 0;
+            }
+            // derive old-side frontier (same delta as the hunk's first line)
+            let frontier_old = self
+                .expansions
+                .get(&(fi, hi))
+                .and_then(|e| e.above.first())
+                .and_then(|l| l.old_lineno)
+                .unwrap_or_else(|| self.files[fi].hunks[hi].old_start);
+            let mut prepend: Vec<DiffLine> = Vec::with_capacity(added);
+            for k in 0..added {
+                let nl = frontier_new - added + k;
+                let ol = frontier_old - added + k;
+                let content = lines
+                    .get(nl.saturating_sub(1))
+                    .cloned()
+                    .unwrap_or_default();
+                prepend.push(DiffLine {
+                    kind: LineKind::Context,
+                    old_lineno: Some(ol),
+                    new_lineno: Some(nl),
+                    content,
+                });
+            }
+            let exp = self.expansions.entry((fi, hi)).or_default();
+            let mut new_above = prepend;
+            new_above.extend(std::mem::take(&mut exp.above));
+            exp.above = new_above;
+            added
+        } else {
+            let frontier_new = self.below_frontier_new(fi, hi);
+            let upper_bound_new = match self.below_upper_bound_new(fi, hi) {
+                Some(b) => b,
+                None => frontier_new + count, // unknown — bound by count
+            };
+            // also clip to actual file length if we know it
+            let upper_bound_new = match self.file_max_new_lineno(fi) {
+                Some(max) => upper_bound_new.min(max),
+                None => upper_bound_new,
+            };
+            let available = upper_bound_new.saturating_sub(frontier_new);
+            let added = count.min(available);
+            if added == 0 {
+                return 0;
+            }
+            let frontier_old = self
+                .expansions
+                .get(&(fi, hi))
+                .and_then(|e| e.below.last())
+                .and_then(|l| l.old_lineno)
+                .unwrap_or_else(|| {
+                    let h = &self.files[fi].hunks[hi];
+                    h.old_start + h.old_count - 1
+                });
+            let mut append: Vec<DiffLine> = Vec::with_capacity(added);
+            for k in 1..=added {
+                let nl = frontier_new + k;
+                let ol = frontier_old + k;
+                if nl > lines.len() {
+                    break;
+                }
+                let content = lines
+                    .get(nl.saturating_sub(1))
+                    .cloned()
+                    .unwrap_or_default();
+                append.push(DiffLine {
+                    kind: LineKind::Context,
+                    old_lineno: Some(ol),
+                    new_lineno: Some(nl),
+                    content,
+                });
+            }
+            let n = append.len();
+            let exp = self.expansions.entry((fi, hi)).or_default();
+            exp.below.extend(append);
+            n
+        };
+        self.rebuild_flat();
+        self.ensure_cursor_visible();
+        added
+    }
+
     pub fn replace_files(&mut self, files: Vec<FileDiff>) {
         let expanded: Vec<bool> = files.iter().map(|f| !self.viewed.contains(&f.path)).collect();
         let total_additions = files.iter().map(|f| f.additions).sum();
@@ -272,9 +697,12 @@ impl AppState {
         self.expanded = expanded;
         self.highlights = highlights;
         self.intraline = intraline;
+        // Hunk indices and file contents may have shifted; drop stale state.
+        self.expansions.clear();
+        self.file_blobs.clear();
         self.total_additions = total_additions;
         self.total_deletions = total_deletions;
-        self.flat = flatten(&self.files, &self.expanded);
+        self.rebuild_flat();
         self.cursor = self.cursor.min(self.flat.len().saturating_sub(1));
         self.scroll = self.scroll.min(self.flat.len().saturating_sub(1));
         self.clear_selection();
@@ -293,14 +721,18 @@ impl AppState {
     }
 
     pub fn jump_to_draft(&mut self, draft_idx: usize) {
-        let Some(d) = self.drafts.get(draft_idx) else { return };
-        let Some(fi) = self.files.iter().position(|f| f.path == d.file_path) else { return };
-        // expand the file so the line is visible
+        // copy out the anchor data to release the immutable borrow before rebuild_flat
+        let (anchor_path, anchor_old, anchor_new) = match self.drafts.get(draft_idx) {
+            Some(d) => (d.file_path.clone(), d.old_lineno, d.new_lineno),
+            None => return,
+        };
+        let Some(fi) = self.files.iter().position(|f| f.path == anchor_path) else {
+            return;
+        };
         if !self.expanded.get(fi).copied().unwrap_or(true) {
             self.expanded[fi] = true;
-            self.flat = flatten(&self.files, &self.expanded);
+            self.rebuild_flat();
         }
-        // find the line matching the draft anchor
         let target_idx = self.flat.iter().position(|fl| {
             if fl.file_idx != fi || fl.kind != FlatKind::Code {
                 return false;
@@ -310,7 +742,7 @@ impl AppState {
             let Some(line) = self.files[fi].hunks.get(hi).and_then(|h| h.lines.get(li)) else {
                 return false;
             };
-            line.old_lineno == d.old_lineno && line.new_lineno == d.new_lineno
+            line.old_lineno == anchor_old && line.new_lineno == anchor_new
         });
         if let Some(i) = target_idx {
             self.cursor = i;
@@ -490,6 +922,18 @@ impl AppState {
             .map(|d| d.body.clone())
     }
 
+    pub fn draft_for_selection(&self) -> Option<usize> {
+        let keys = self.selection_lines();
+        let (fi, hi, li) = *keys.first()?;
+        let file = self.files.get(fi)?;
+        let line = file.hunks.get(hi)?.lines.get(li)?;
+        self.drafts.iter().position(|d| {
+            d.file_path == file.path
+                && d.new_lineno == line.new_lineno
+                && d.old_lineno == line.old_lineno
+        })
+    }
+
     pub fn draft_for_cursor(&self) -> Option<usize> {
         let (file, _, line) = self.current_line()?;
         self.drafts.iter().position(|d| {
@@ -614,7 +1058,13 @@ impl AppState {
     }
 }
 
-fn flatten(files: &[FileDiff], expanded: &[bool]) -> Vec<FlatLine> {
+fn flatten(
+    files: &[FileDiff],
+    expanded: &[bool],
+    _expansions: &HashMap<(usize, usize), Expansion>,
+) -> Vec<FlatLine> {
+    // Stub kept for backward call sites that don't yet route through AppState
+    // (e.g., the bootstrap from new() before AppState is constructed).
     let mut out = Vec::new();
     for (fi, file) in files.iter().enumerate() {
         out.push(FlatLine {
@@ -622,6 +1072,7 @@ fn flatten(files: &[FileDiff], expanded: &[bool]) -> Vec<FlatLine> {
             file_idx: fi,
             hunk_idx: None,
             line_idx: None,
+                        draft_idx: None,
         });
         if expanded.get(fi).copied().unwrap_or(true) {
             for (hi, hunk) in file.hunks.iter().enumerate() {
@@ -630,6 +1081,7 @@ fn flatten(files: &[FileDiff], expanded: &[bool]) -> Vec<FlatLine> {
                     file_idx: fi,
                     hunk_idx: Some(hi),
                     line_idx: None,
+                        draft_idx: None,
                 });
                 for (li, _) in hunk.lines.iter().enumerate() {
                     out.push(FlatLine {
@@ -637,6 +1089,7 @@ fn flatten(files: &[FileDiff], expanded: &[bool]) -> Vec<FlatLine> {
                         file_idx: fi,
                         hunk_idx: Some(hi),
                         line_idx: Some(li),
+                        draft_idx: None,
                     });
                 }
             }
@@ -646,12 +1099,14 @@ fn flatten(files: &[FileDiff], expanded: &[bool]) -> Vec<FlatLine> {
             file_idx: fi,
             hunk_idx: None,
             line_idx: None,
+                        draft_idx: None,
         });
         out.push(FlatLine {
             kind: FlatKind::Spacer,
             file_idx: fi,
             hunk_idx: None,
             line_idx: None,
+                        draft_idx: None,
         });
     }
     out

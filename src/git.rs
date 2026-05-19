@@ -169,6 +169,20 @@ pub fn get_diff(root: &Path, source: &DiffSource, opts: DiffOpts) -> Result<Stri
     }
 }
 
+/// Read the "new side" content of a file as a Vec of lines. For the working
+/// tree source we read straight from disk; for branch comparisons we use
+/// `git show <head>:<path>`. Returns None if the file can't be fetched
+/// (deletion, binary, missing).
+pub fn read_file_lines(root: &Path, source: &DiffSource, path: &str) -> Option<Vec<String>> {
+    let raw = match source {
+        DiffSource::WorkingTree => std::fs::read_to_string(root.join(path)).ok()?,
+        DiffSource::Branch { head, .. } => {
+            run(&["show", &format!("{head}:{path}")], Some(root)).ok()?
+        }
+    };
+    Some(raw.lines().map(|s| s.to_string()).collect())
+}
+
 pub fn short_sha(root: &Path, refname: &str) -> Option<String> {
     run(&["rev-parse", "--short", refname], Some(root))
         .ok()

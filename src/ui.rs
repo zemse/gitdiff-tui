@@ -5,7 +5,7 @@ use ratatui::Frame;
 use ratatui::layout::{Constraint, Direction, Layout, Rect};
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
-use ratatui::widgets::{Block, Borders, Clear, Paragraph, Wrap};
+use ratatui::widgets::{Block, Borders, Clear, Padding, Paragraph, Wrap};
 use tui_textarea::TextArea;
 
 const ADD_BG: Color = Color::Rgb(20, 60, 30);
@@ -16,6 +16,20 @@ const HEADER_BG: Color = Color::Rgb(40, 44, 60);
 const BORDER_FG: Color = Color::Rgb(80, 90, 110);
 
 pub fn draw(f: &mut Frame, state: &mut AppState, composer: Option<&mut TextArea<'_>>) {
+    // Keep the composer popup sized to its content (+ 2 border rows) so the
+    // user sees the full comment while editing. Capped so it never overflows
+    // the viewport.
+    if state.mode == Mode::Composing {
+        let content_lines = composer
+            .as_ref()
+            .map(|ta| ta.lines().len().max(1))
+            .unwrap_or(1);
+        let desired = (content_lines as u16).saturating_add(2);
+        let cap = (state.viewport_height as u16).saturating_sub(2).max(COMPOSER_MIN_H);
+        state.composer_height = desired.clamp(COMPOSER_MIN_H, cap);
+    } else {
+        state.composer_height = 0;
+    }
     let area = f.area();
     let vert = Layout::default()
         .direction(Direction::Vertical)
@@ -372,13 +386,31 @@ fn draw_body(f: &mut Frame, area: Rect, state: &AppState) {
         height: area.height,
     };
 
+    // Compute the "gap" inserted below the selection when the composer is open
+    // so the canvas grows instead of the popup overlapping text.
+    let (gap_pos, gap_size) = composer_gap(state);
+    let total_rows = state.flat.len() + gap_size;
+
     let width = content_area.width as usize;
     let mut lines: Vec<Line<'static>> = Vec::with_capacity(content_area.height as usize);
     let from = state.scroll;
-    let to = (state.scroll + content_area.height as usize).min(state.flat.len());
+    let to = (state.scroll + content_area.height as usize).min(total_rows);
 
     let sel_range = state.selection.map(|s| s.range());
-    for i in from..to {
+    for ext_i in from..to {
+        // map extended-canvas index to flat[] index, accounting for the gap
+        if gap_size > 0 && ext_i >= gap_pos && ext_i < gap_pos + gap_size {
+            lines.push(Line::from(""));
+            continue;
+        }
+        let i = if ext_i >= gap_pos + gap_size {
+            ext_i - gap_size
+        } else {
+            ext_i
+        };
+        if i >= state.flat.len() {
+            break;
+        }
         let fl = &state.flat[i];
         let line = match fl.kind {
             FlatKind::FileHeader => render_file_header(state, fl.file_idx, width),
@@ -393,10 +425,29 @@ fn draw_body(f: &mut Frame, area: Rect, state: &AppState) {
                 fl.line_idx.unwrap(),
                 width,
             ),
+            FlatKind::ExpandedAbove | FlatKind::ExpandedBelow => render_expanded_line(
+                state,
+                fl.file_idx,
+                fl.hunk_idx.unwrap(),
+                fl.line_idx.unwrap(),
+                fl.kind == FlatKind::ExpandedAbove,
+                width,
+            ),
+            FlatKind::ExpandBtnAbove | FlatKind::ExpandBtnBelow => render_expand_btn(
+                fl.kind == FlatKind::ExpandBtnAbove,
+                fl.line_idx.unwrap_or(20),
+                width,
+            ),
+            FlatKind::DraftRow => render_draft_row(
+                state,
+                fl.draft_idx.unwrap_or(0),
+                fl.line_idx.unwrap_or(0),
+                width,
+            ),
             FlatKind::Spacer => Line::from(""),
         };
         let in_selection = sel_range.map(|(a, b)| i >= a && i <= b).unwrap_or(false);
-        let is_cursor_solo = sel_range.is_none() && i == state.cursor;
+        let is_cursor_solo = sel_range.is_none() && state.cursor_visible && i == state.cursor;
         let line = if in_selection || is_cursor_solo {
             highlight_line(line)
         } else {
@@ -410,9 +461,22 @@ fn draw_body(f: &mut Frame, area: Rect, state: &AppState) {
         f,
         sb_area,
         state.scroll,
-        state.flat.len(),
+        total_rows,
         content_area.height as usize,
     );
+}
+
+/// Returns (extended_position, height) of the composer-induced gap.
+/// `(0, 0)` when the composer is not open.
+fn composer_gap(state: &AppState) -> (usize, usize) {
+    if state.mode != Mode::Composing {
+        return (0, 0);
+    }
+    let end = state
+        .selection
+        .map(|s| s.range().1)
+        .unwrap_or(state.cursor);
+    (end + 1, state.composer_height.max(COMPOSER_MIN_H) as usize)
 }
 
 fn draw_scrollbar(f: &mut Frame, area: Rect, scroll: usize, total: usize, visible_h: usize) {
@@ -420,8 +484,12 @@ fn draw_scrollbar(f: &mut Frame, area: Rect, scroll: usize, total: usize, visibl
     if track_h == 0 || area.width == 0 {
         return;
     }
-    let track_style = Style::default().fg(BORDER_FG);
-    let thumb_style = Style::default().fg(Color::Rgb(150, 170, 210));
+    // Paint the cell BACKGROUND rather than rely on a glyph (`█`) — many
+    // terminals add line-spacing padding between rows that no character can
+    // cover, but the cell bg fills the entire cell including that padding.
+    // We render a literal space so there's no font glyph involved at all.
+    let track_style = Style::default().bg(Color::Rgb(38, 44, 58));
+    let thumb_style = Style::default().bg(Color::Rgb(150, 170, 210));
 
     let (thumb_top, thumb_h) = if total <= visible_h || total == 0 {
         (0, track_h)
@@ -440,11 +508,8 @@ fn draw_scrollbar(f: &mut Frame, area: Rect, scroll: usize, total: usize, visibl
     let lines: Vec<Line<'static>> = (0..track_h)
         .map(|i| {
             let in_thumb = i >= thumb_top && i < thumb_top + thumb_h;
-            if in_thumb {
-                Line::from(Span::styled("█", thumb_style))
-            } else {
-                Line::from(Span::styled("│", track_style))
-            }
+            let style = if in_thumb { thumb_style } else { track_style };
+            Line::from(Span::styled(" ", style))
         })
         .collect();
     f.render_widget(Paragraph::new(lines), area);
@@ -531,18 +596,48 @@ fn render_file_footer(width: usize) -> Line<'static> {
 
 fn render_hunk_header(state: &AppState, fi: usize, hi: usize, width: usize) -> Line<'static> {
     let h = &state.files[fi].hunks[hi];
+    let collapsed = state.collapsed_hunks.contains(&(fi, hi));
+    let chevron = if collapsed { '▸' } else { '▾' };
     let border = Style::default().fg(BORDER_FG);
     let body = Style::default()
         .fg(Color::Rgb(120, 170, 200))
         .bg(Color::Rgb(30, 40, 60))
         .add_modifier(Modifier::ITALIC);
-    let text = format!(" {} ", h.header_text());
-    let pad = width
-        .saturating_sub(text.chars().count() + 2)
-        .max(0);
+    let hint = if collapsed {
+        format!("  ({} lines)", h.lines.len())
+    } else {
+        String::new()
+    };
+    let text = format!(" {chevron} {}{} ", h.header_text(), hint);
+    let pad = width.saturating_sub(text.chars().count() + 2).max(0);
     Line::from(vec![
         Span::styled("│".to_string(), border),
         Span::styled(text, body),
+        Span::styled(" ".repeat(pad), body),
+        Span::styled("│".to_string(), border),
+    ])
+}
+
+fn render_expand_btn(above: bool, count: usize, width: usize) -> Line<'static> {
+    let border = Style::default().fg(BORDER_FG);
+    let bg = Color::Rgb(28, 36, 50);
+    let body = Style::default().bg(bg);
+    let glyph_fg = Color::Rgb(180, 200, 230);
+    let label_fg = Color::Rgb(150, 170, 200);
+    let chevron = if above { "▲" } else { "▼" };
+    let action = if count > 20 { "expand all" } else if above { "expand 20 above" } else { "expand 20 below" };
+    let label = if count <= 20 && count > 0 && count < 20 {
+        format!("  {chevron} expand {count}  ")
+    } else if count > 20 {
+        format!("  ▲▼ expand {count}  ")
+    } else {
+        format!("  {chevron} {action}  ")
+    };
+    let _ = (glyph_fg, label_fg);
+    let pad = width.saturating_sub(label.chars().count() + 2);
+    Line::from(vec![
+        Span::styled("│".to_string(), border),
+        Span::styled(label, body.fg(Color::Rgb(180, 200, 230)).add_modifier(Modifier::BOLD)),
         Span::styled(" ".repeat(pad), body),
         Span::styled("│".to_string(), border),
     ])
@@ -655,6 +750,134 @@ fn render_code_line(
     Line::from(spans)
 }
 
+fn render_expanded_line(
+    state: &AppState,
+    fi: usize,
+    hi: usize,
+    li: usize,
+    above: bool,
+    width: usize,
+) -> Line<'static> {
+    let exp = match state.expansions.get(&(fi, hi)) {
+        Some(e) => e,
+        None => return Line::from(""),
+    };
+    let l = if above { exp.above.get(li) } else { exp.below.get(li) };
+    let l = match l {
+        Some(l) => l,
+        None => return Line::from(""),
+    };
+    // muted bg distinguishes expanded context from regular diff body
+    const EXPANDED_BG: Color = Color::Rgb(24, 28, 36);
+    let bg = EXPANDED_BG;
+    let bg_style = Style::default().bg(bg);
+    let border = Style::default().fg(BORDER_FG);
+
+    let old_g = l
+        .old_lineno
+        .map(|n| format!("{n:>4}"))
+        .unwrap_or_else(|| "    ".to_string());
+    let new_g = l
+        .new_lineno
+        .map(|n| format!("{n:>4}"))
+        .unwrap_or_else(|| "    ".to_string());
+    let tab_str = " ".repeat(state.tab_width);
+    let content = l.content.replace('\t', &tab_str);
+
+    let mut spans = vec![
+        Span::styled("│".to_string(), border),
+        Span::styled("   ", bg_style),
+        Span::styled(old_g, bg_style.fg(Color::Rgb(90, 100, 120))),
+        Span::styled(" ", bg_style),
+        Span::styled(new_g, bg_style.fg(Color::Rgb(90, 100, 120))),
+        Span::styled("   ", bg_style),
+        Span::styled(content, bg_style.fg(Color::Rgb(160, 170, 190))),
+    ];
+    let used = visible_width(&spans);
+    let pad = width.saturating_sub(used + 1);
+    spans.push(Span::styled(" ".repeat(pad), bg_style));
+    spans.push(Span::styled("│".to_string(), border));
+    Line::from(spans)
+}
+
+/// Renders a draft as a read-only mirror of the composer Block: yellow border,
+/// dark-blue interior, title on the top edge. Clicking transitions to the real
+/// composer, so the visual layout is unchanged — just a cursor appears.
+fn render_draft_row(state: &AppState, draft_idx: usize, sub: usize, width: usize) -> Line<'static> {
+    let d = match state.drafts.get(draft_idx) {
+        Some(d) => d,
+        None => return Line::from(""),
+    };
+    // Match draw_composer's Block style exactly.
+    const BOX_BG: Color = Color::Rgb(20, 28, 40);
+    let border = Style::default().fg(Color::Yellow).bg(BOX_BG);
+    let bg = Style::default().bg(BOX_BG);
+    let text = bg.fg(Color::Rgb(220, 230, 245));
+    let muted = bg.fg(Color::Rgb(150, 160, 180));
+
+    let body_lines: Vec<&str> = d.body.lines().collect();
+    let body_count = body_lines.len().max(1);
+    let has_react = !d.reactions.is_empty();
+    let total = 2 + body_count + if has_react { 1 } else { 0 };
+    let bottom_idx = total - 1;
+    // Box must be at least 2 cols wide (for the two corner glyphs).
+    let inner_w = width.saturating_sub(2);
+
+    // Top edge with title — mirrors a ratatui Block's title placement.
+    if sub == 0 {
+        let (status_txt, status_color) = if d.resolved {
+            ("✓ resolved", Color::Green)
+        } else if d.outdated {
+            ("! outdated", Color::Rgb(220, 160, 50))
+        } else {
+            ("◆ open", Color::Yellow)
+        };
+        let ts = d.created_at.format("%Y-%m-%d %H:%M").to_string();
+        let title_prefix = " ";
+        let title_suffix = format!(" · {ts} ");
+        let title_chars =
+            title_prefix.chars().count() + status_txt.chars().count() + title_suffix.chars().count();
+        let dashes = inner_w.saturating_sub(title_chars);
+        return Line::from(vec![
+            Span::styled("┌".to_string(), border),
+            Span::styled(title_prefix.to_string(), bg),
+            Span::styled(
+                status_txt.to_string(),
+                bg.fg(status_color).add_modifier(Modifier::BOLD),
+            ),
+            Span::styled(title_suffix, muted.add_modifier(Modifier::ITALIC)),
+            Span::styled("─".repeat(dashes), border),
+            Span::styled("┐".to_string(), border),
+        ]);
+    }
+
+    // Bottom edge.
+    if sub == bottom_idx {
+        return Line::from(vec![
+            Span::styled("└".to_string(), border),
+            Span::styled("─".repeat(inner_w), border),
+            Span::styled("┘".to_string(), border),
+        ]);
+    }
+
+    // Content rows: body lines, then (optionally) reactions.
+    let label = if sub <= body_count {
+        let bi = sub - 1;
+        let txt = body_lines.get(bi).copied().unwrap_or("");
+        format!(" {txt}")
+    } else {
+        format!(" {}", d.reactions.join(" "))
+    };
+    let used = label.chars().count();
+    let pad = inner_w.saturating_sub(used);
+    Line::from(vec![
+        Span::styled("│".to_string(), border),
+        Span::styled(label, text),
+        Span::styled(" ".repeat(pad), bg),
+        Span::styled("│".to_string(), border),
+    ])
+}
+
 fn apply_intraline(
     spans: Vec<Span<'static>>,
     intra: IntraRange,
@@ -719,6 +942,12 @@ fn visible_width(spans: &[Span<'_>]) -> usize {
 
 const SELECTION_BG: Color = Color::Rgb(50, 80, 135);
 
+/// Initial / minimum height of the inline composer popup (rows, including
+/// the 2 border rows). 3 = top border + 1 content row + bottom border, which
+/// matches the read-only draft view's height for a single-line comment. The
+/// height grows with the body content so the full comment fits.
+pub const COMPOSER_MIN_H: u16 = 3;
+
 fn highlight_line(line: Line<'static>) -> Line<'static> {
     let spans: Vec<Span<'static>> = line
         .spans
@@ -735,24 +964,13 @@ fn highlight_line(line: Line<'static>) -> Line<'static> {
 }
 
 fn composer_rect(body: Rect, state: &AppState) -> Rect {
-    let h: u16 = 7;
-    let sel = state.selection;
-    let (_a, b) = sel.map(|s| s.range()).unwrap_or((state.cursor, state.cursor));
-    let scroll = state.scroll;
-    let screen_row = (b.saturating_sub(scroll)) as u16;
-    let anchor_y = body.y + screen_row;
-    let space_below = (body.y + body.height).saturating_sub(anchor_y + 1);
-    let y = if space_below >= h {
-        anchor_y + 1
-    } else {
-        // place above selection start
-        let (a, _) = sel.map(|s| s.range()).unwrap_or((state.cursor, state.cursor));
-        let start_screen = (a.saturating_sub(scroll)) as u16;
-        let start_y = body.y + start_screen;
-        start_y.saturating_sub(h)
-    };
-    // clamp x/width to body
-    let w = body.width.min(body.width).max(20);
+    let (gap_pos, gap_h) = composer_gap(state);
+    let h = (gap_h as u16).min(body.height.max(1));
+    // gap_pos is in extended-canvas coords; subtract scroll to get screen row.
+    let screen_row = gap_pos.saturating_sub(state.scroll) as u16;
+    let y = (body.y + screen_row).min(body.y + body.height.saturating_sub(h));
+    // composer occupies the diff body's width minus the scrollbar column
+    let w = body.width.saturating_sub(1).max(20);
     Rect {
         x: body.x,
         y,
@@ -769,7 +987,10 @@ fn draw_composer(f: &mut Frame, popup: Rect, state: &AppState, ta: &mut TextArea
         .borders(Borders::ALL)
         .title(title)
         .border_style(Style::default().fg(Color::Yellow))
-        .style(Style::default().bg(Color::Rgb(20, 28, 40)));
+        .style(Style::default().bg(Color::Rgb(20, 28, 40)))
+        // Match the read-only draft view, which leaves a 1-col gap between
+        // the border and the body text.
+        .padding(Padding::horizontal(1));
     ta.set_block(block);
     f.render_widget(&*ta, popup);
 }
@@ -823,8 +1044,8 @@ fn draw_help(f: &mut Frame, area: Rect) {
         Line::from("  ]   /   [    next / prev file"),
         Line::from("  }   /   {    next / prev hunk"),
         Line::from(""),
-        Line::from("  space        collapse / expand current file"),
-        Line::from("  z / Z        collapse all / expand all"),
+        Line::from("  space        collapse / expand current hunk (on @@) or file (elsewhere)"),
+        Line::from("  z / Z        collapse all / expand all files"),
         Line::from("  v            toggle viewed (auto-collapses)"),
         Line::from("  y            yank current file path to clipboard"),
         Line::from("  e            toggle file tree sidebar"),
