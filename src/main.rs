@@ -107,6 +107,12 @@ fn main() -> Result<()> {
     if merged_any || deduped_any {
         let _ = review::save_drafts(&root, &source, &drafts);
     }
+    // Drift-resistant re-anchor: snap drafts to the current line numbers
+    // when the surrounding code has moved. Also backfills `anchor_content`
+    // for drafts saved before that field existed.
+    if app::reanchor_drafts(&mut drafts, &files) {
+        let _ = review::save_drafts(&root, &source, &drafts);
+    }
     let mut viewed = review::load_viewed(&root, &source).unwrap_or_default();
     // Drop viewed marks whose stored hash no longer matches the file's current
     // diff content — that's the "this file changed since you marked it viewed,
@@ -178,6 +184,10 @@ fn run_loop<B: ratatui::backend::Backend>(
         })?;
 
         if !event::poll(Duration::from_millis(250))? {
+            // Idle tick: pick up agent edits to REVIEW.md.
+            if poll_review_file(state, root) {
+                // The next iteration renders the imported replies.
+            }
             continue;
         }
         let ev = event::read()?;
@@ -443,6 +453,7 @@ fn handle_normal(
                 state.verdict,
             )?;
             review::save_drafts(root, &state.source, &state.drafts)?;
+            stamp_review_mtime(state, root);
             state.status = Some(format!("wrote {} ({})", p.display(), state.verdict.label()));
         }
         KeyCode::Char('r') => {
@@ -475,6 +486,63 @@ fn handle_normal(
         _ => {}
     }
     Ok(())
+}
+
+/// Re-imports replies from REVIEW-*.md when the file has been modified since
+/// we last touched it. Cheap: skipped entirely when the mtime hasn't changed.
+/// Self-writes don't trigger a re-import — `stamp_review_mtime` is called
+/// after every write_review to bring the cached mtime in sync.
+fn poll_review_file(state: &mut AppState, root: &std::path::Path) -> bool {
+    let p = review::review_path(root, &state.source);
+    let mtime = match std::fs::metadata(&p).and_then(|m| m.modified()) {
+        Ok(t) => t,
+        Err(_) => return false,
+    };
+    if state.last_review_mtime == Some(mtime) {
+        return false;
+    }
+    let prev = state.last_review_mtime.replace(mtime);
+    // First sighting (prev is None) just primes the cache — don't re-import
+    // the file we just loaded at startup.
+    if prev.is_none() {
+        return false;
+    }
+    let Ok(text) = std::fs::read_to_string(&p) else { return false };
+    let map = review::parse_review_replies(&text);
+    let mut changed = false;
+    for d in state.drafts.iter_mut() {
+        if let Some(import) = map.get(&d.thread_id) {
+            for r in &import.replies {
+                let dup = d.replies.iter().any(|x| {
+                    x.author == r.author && x.created_at == r.created_at && x.body == r.body
+                });
+                if !dup {
+                    d.replies.push(r.clone());
+                    changed = true;
+                }
+            }
+            if import.resolved && !d.resolved {
+                d.resolved = true;
+                changed = true;
+            }
+        }
+    }
+    if changed {
+        let _ = review::save_drafts(root, &state.source, &state.drafts);
+        state.rebuild_flat();
+        state.status = Some("imported replies from REVIEW.md".into());
+    }
+    changed
+}
+
+/// Updates the cached REVIEW.md mtime to whatever the file currently shows.
+/// Call after any successful `write_review` so the next poll tick treats our
+/// own write as expected and doesn't re-import.
+fn stamp_review_mtime(state: &mut AppState, root: &std::path::Path) {
+    let p = review::review_path(root, &state.source);
+    if let Ok(t) = std::fs::metadata(&p).and_then(|m| m.modified()) {
+        state.last_review_mtime = Some(t);
+    }
 }
 
 fn handle_composer_mouse(
@@ -993,6 +1061,7 @@ fn handle_composing(
                         state.verdict,
                     ) {
                         suffix = format!("REVIEW.md updated → {}", p.display());
+                        stamp_review_mtime(state, root);
                     }
                 }
                 let msg = match target {

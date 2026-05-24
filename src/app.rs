@@ -59,6 +59,12 @@ pub struct Draft {
     /// blocks on launch, then preserved through subsequent submits.
     #[serde(default)]
     pub replies: Vec<Reply>,
+    /// Verbatim text of the anchor line at the time the draft was created.
+    /// Used at launch to re-anchor the draft when surrounding code shifts the
+    /// line numbers — we search the new diff for this exact content and snap
+    /// the lineno to the closest match.
+    #[serde(default)]
+    pub anchor_content: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -258,6 +264,10 @@ pub struct AppState {
     // `body_width` last used when computing `flat`. Drives a re-flatten on
     // resize so draft sub-row counts match the new wrap.
     pub flat_for_body_width: u16,
+    // mtime of REVIEW-*.md the last time we read or wrote it. The event loop
+    // polls this every tick and re-imports replies if the file has changed
+    // externally (e.g. an agent appended a `> [@...] ...` line).
+    pub last_review_mtime: Option<std::time::SystemTime>,
 }
 
 #[derive(Debug, Clone)]
@@ -320,6 +330,7 @@ impl AppState {
             composer_rect: None,
             selection_menu_rect: None,
             flat_for_body_width: 0,
+            last_review_mtime: None,
         };
         // start on first code line if possible
         if let Some(i) = s.flat.iter().position(|l| l.kind == FlatKind::Code) {
@@ -1288,6 +1299,7 @@ impl AppState {
             reactions: Vec::new(),
             thread_id,
             replies: Vec::new(),
+            anchor_content: last_line.content.clone(),
         });
         Some(())
     }
@@ -1473,6 +1485,63 @@ fn precompute_highlights(files: &[FileDiff]) -> HashMap<LineKey, Vec<HSpan>> {
 fn fuzzy_match(haystack: &str, needle: &str) -> bool {
     let mut it = haystack.chars();
     needle.chars().all(|c| it.any(|h| h == c))
+}
+
+/// Drift-resistant re-anchor: when surrounding code has changed and the
+/// stored anchor line no longer sits at the same lineno, search the current
+/// diff for the verbatim `anchor_content` and snap the draft to the closest
+/// match. Backfills `anchor_content` from the current anchor line for drafts
+/// loaded from older JSON that don't have it yet. Returns whether anything
+/// changed (so main.rs can re-save the JSON).
+pub fn reanchor_drafts(drafts: &mut [Draft], files: &[FileDiff]) -> bool {
+    let mut changed = false;
+    for d in drafts.iter_mut() {
+        let Some(file) = files.iter().find(|f| f.path == d.file_path) else {
+            continue;
+        };
+        let anchor_now = file.hunks.iter().find_map(|h| {
+            h.lines
+                .iter()
+                .find(|l| l.old_lineno == d.old_lineno && l.new_lineno == d.new_lineno)
+        });
+        // Backfill: a draft saved before the anchor_content field existed
+        // adopts the current anchor's content as its cue.
+        if d.anchor_content.is_empty() {
+            if let Some(l) = anchor_now {
+                d.anchor_content = l.content.clone();
+                changed = true;
+            }
+            continue;
+        }
+        // Same lineno still holds the same text → nothing to do.
+        if anchor_now.map(|l| l.content == d.anchor_content).unwrap_or(false) {
+            continue;
+        }
+        // Otherwise scan all hunks for an exact content match; pick the
+        // candidate whose lineno is closest to the stored anchor.
+        let stored_ln = d.new_lineno.or(d.old_lineno).unwrap_or(0) as i64;
+        let mut best: Option<(i64, Option<usize>, Option<usize>)> = None;
+        for h in &file.hunks {
+            for l in &h.lines {
+                if l.content != d.anchor_content {
+                    continue;
+                }
+                let ln = l.new_lineno.or(l.old_lineno).unwrap_or(0) as i64;
+                let dist = (ln - stored_ln).abs();
+                if best.map(|(b, _, _)| dist < b).unwrap_or(true) {
+                    best = Some((dist, l.old_lineno, l.new_lineno));
+                }
+            }
+        }
+        if let Some((_, new_old, new_new)) = best {
+            if new_old != d.old_lineno || new_new != d.new_lineno {
+                d.old_lineno = new_old;
+                d.new_lineno = new_new;
+                changed = true;
+            }
+        }
+    }
+    changed
 }
 
 /// Hashes a file's diff content (all hunks + line numbers + kinds) so we can
