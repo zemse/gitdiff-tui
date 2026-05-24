@@ -854,17 +854,34 @@ fn open_composer(state: &mut AppState, composer: &mut Option<TextArea<'static>>)
         .saturating_add(2)
         .max(ui::COMPOSER_MIN_H);
     state.composer_height = h;
-    // Scroll so the selection and the inserted composer-gap fit in view.
-    // Gap occupies rows [b+1, b+1+H) in extended coords (see ui::composer_gap).
-    if let Some(sel) = state.selection {
-        let (a, b) = sel.range();
-        let composer_h = state.composer_height as usize;
-        let needed_scroll_floor = (b + 1 + composer_h).saturating_sub(state.viewport_height);
-        // keep selection start visible at the top
-        let target = needed_scroll_floor.min(a);
-        if state.scroll < target {
-            state.scroll = target;
-        }
+    // Scroll so the composer-gap fits in view. For new/edit-draft the gap is
+    // anchored at the selection end; for reply targets it sits below the
+    // draft's last row.
+    let composer_h = state.composer_height as usize;
+    let gap_pos: usize = match target {
+        ComposerTarget::NewReply(idx) | ComposerTarget::EditReply { draft_idx: idx, .. } => state
+            .flat
+            .iter()
+            .enumerate()
+            .rev()
+            .find_map(|(i, fl)| {
+                (fl.kind == FlatKind::DraftRow && fl.draft_idx == Some(idx)).then_some(i + 1)
+            })
+            .unwrap_or_else(|| state.selection.map(|s| s.range().1 + 1).unwrap_or(state.cursor)),
+        _ => state
+            .selection
+            .map(|s| s.range().1 + 1)
+            .unwrap_or(state.cursor),
+    };
+    let needed_scroll_floor = (gap_pos + composer_h).saturating_sub(state.viewport_height);
+    // Keep the selection (or the head of the draft) visible at the top if possible.
+    let keep_top = state
+        .selection
+        .map(|s| s.range().0)
+        .unwrap_or(state.cursor);
+    let scroll_target = needed_scroll_floor.min(keep_top);
+    if state.scroll < scroll_target {
+        state.scroll = scroll_target;
     }
 }
 

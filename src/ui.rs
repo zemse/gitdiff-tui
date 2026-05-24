@@ -599,18 +599,36 @@ fn draw_selection_menu(f: &mut Frame, body: Rect, state: &AppState) -> Option<Re
 /// Returns (extended_position, height) of the composer-induced gap.
 /// `(0, 0)` when the composer is not open.
 ///
-/// The gap is placed right after the *last* selected line so the popup sits
-/// where the user finished dragging. Drafts now anchor at the same line (see
-/// `app::AppState::add_draft_from_selection`), so the box doesn't jump on save.
+/// For `NewDraft` / `EditDraft` the gap sits right after the *last* selected
+/// line — the draft is hidden so the composer takes its slot. For reply
+/// targets the thread stays visible and the gap is placed just below the
+/// draft's bottom border so the user can still read the conversation while
+/// they type.
 fn composer_gap(state: &AppState) -> (usize, usize) {
     if state.mode != Mode::Composing {
         return (0, 0);
+    }
+    let h = state.composer_height.max(COMPOSER_MIN_H) as usize;
+    // Reply targets: find the last DraftRow of the attached draft and place
+    // the gap right after it.
+    if let Some(ComposerTarget::NewReply(idx) | ComposerTarget::EditReply { draft_idx: idx, .. }) =
+        state.composer_target
+    {
+        if let Some(last) = state
+            .flat
+            .iter()
+            .enumerate()
+            .rev()
+            .find_map(|(i, fl)| (fl.kind == FlatKind::DraftRow && fl.draft_idx == Some(idx)).then_some(i))
+        {
+            return (last + 1, h);
+        }
     }
     let anchor = state
         .selection
         .map(|s| s.range().1)
         .unwrap_or(state.cursor);
-    (anchor + 1, state.composer_height.max(COMPOSER_MIN_H) as usize)
+    (anchor + 1, h)
 }
 
 fn draw_scrollbar(f: &mut Frame, area: Rect, scroll: usize, total: usize, visible_h: usize) {

@@ -92,16 +92,17 @@ pub enum ComposerTarget {
 }
 
 impl ComposerTarget {
-    /// Which draft (if any) should hide while the composer is open. The draft
-    /// being edited/replied to is hidden so the composer takes its slot.
+    /// Which draft (if any) should hide while the composer is open. Only
+    /// `EditDraft` hides the box — for reply targets the thread stays visible
+    /// so the user can see what they're responding to, and the composer
+    /// renders just below it.
     pub fn hides_draft(&self) -> Option<usize> {
         match self {
-            ComposerTarget::EditDraft(idx)
-            | ComposerTarget::EditReply { draft_idx: idx, .. }
-            | ComposerTarget::NewReply(idx) => Some(*idx),
-            ComposerTarget::NewDraft => None,
+            ComposerTarget::EditDraft(idx) => Some(*idx),
+            _ => None,
         }
     }
+
 }
 
 impl Draft {
