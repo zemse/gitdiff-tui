@@ -665,10 +665,11 @@ fn render_code_line(
     let hunk = &file.hunks[hi];
     let l = &hunk.lines[li];
 
-    let draft_at = state.drafts.iter().find(|d| {
-        d.file_path == file.path && d.old_lineno == l.old_lineno && d.new_lineno == l.new_lineno
+    let cover = state.draft_covering_line(fi, l);
+    let draft_at = cover.and_then(|(idx, is_anchor)| {
+        if is_anchor { state.drafts.get(idx) } else { None }
     });
-    let has_draft = draft_at.is_some();
+    let in_range = cover.is_some();
 
     let (bg, sign_color) = match l.kind {
         LineKind::Added => (ADD_BG, Color::Green),
@@ -676,7 +677,16 @@ fn render_code_line(
         LineKind::Context => (Color::Reset, Color::DarkGray),
     };
     let bg_style = Style::default().bg(bg);
-    let border = Style::default().fg(BORDER_FG);
+    // In-range lines wear yellow borders so a multi-line draft visually frames
+    // the lines it covers, joining up with the embedded draft box.
+    let range_draft = cover.and_then(|(idx, _)| state.drafts.get(idx));
+    let border_color = match range_draft {
+        Some(d) if d.resolved => Color::Green,
+        Some(d) if d.outdated => Color::Rgb(220, 160, 50),
+        Some(_) => Color::Yellow,
+        None => BORDER_FG,
+    };
+    let border = Style::default().fg(border_color);
 
     let old_g = match l.old_lineno {
         Some(n) => format!("{n:>4}"),
@@ -691,19 +701,16 @@ fn render_code_line(
         LineKind::Deleted => '-',
         LineKind::Context => ' ',
     };
-    let mark = match draft_at {
-        Some(d) if d.resolved => '✓',
-        Some(d) if d.outdated => '!',
-        Some(_) => '◆',
-        None => ' ',
+    // Anchor row gets the status glyph; non-anchor rows in the range get a
+    // continuation bar so the eye tracks the run from the anchor down.
+    let mark = match (draft_at, in_range) {
+        (Some(d), _) if d.resolved => '✓',
+        (Some(d), _) if d.outdated => '!',
+        (Some(_), _) => '◆',
+        (None, true) => '┃',
+        (None, false) => ' ',
     };
-    let mark_color = match draft_at {
-        Some(d) if d.resolved => Color::Green,
-        Some(d) if d.outdated => Color::Rgb(180, 130, 50),
-        Some(_) => Color::Yellow,
-        None => Color::Yellow,
-    };
-    let _ = has_draft;
+    let mark_color = border_color;
 
     let mut spans = vec![
         Span::styled("│".to_string(), border),

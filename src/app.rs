@@ -934,6 +934,37 @@ impl AppState {
         })
     }
 
+    /// Returns `(draft_idx, is_anchor)` if `line` falls inside a draft's range.
+    /// `is_anchor` is true for the row the draft renders on (its start line); a
+    /// multi-line draft also covers the intermediate/end rows so the UI can
+    /// frame the whole range, not just the anchor.
+    pub fn draft_covering_line(&self, fi: usize, line: &DiffLine) -> Option<(usize, bool)> {
+        let path = &self.files.get(fi)?.path;
+        self.drafts.iter().enumerate().find_map(|(idx, d)| {
+            if &d.file_path != path {
+                return None;
+            }
+            if d.old_lineno == line.old_lineno && d.new_lineno == line.new_lineno {
+                return Some((idx, true));
+            }
+            // Multi-line: include rows past the anchor up to the recorded end.
+            // Strict `>` skips the anchor (already matched above).
+            if let (Some(s), Some(e), Some(ln)) = (d.new_lineno, d.new_lineno_end, line.new_lineno)
+            {
+                if ln > s && ln <= e {
+                    return Some((idx, false));
+                }
+            }
+            if let (Some(s), Some(e), Some(ln)) = (d.old_lineno, d.old_lineno_end, line.old_lineno)
+            {
+                if ln > s && ln <= e {
+                    return Some((idx, false));
+                }
+            }
+            None
+        })
+    }
+
     pub fn draft_for_cursor(&self) -> Option<usize> {
         let (file, _, line) = self.current_line()?;
         self.drafts.iter().position(|d| {
