@@ -1,12 +1,38 @@
-use crate::app::{self, AppState, ComposerTarget, FlatKind, IntraRange, LineKey, Mode};
+use crate::app::{
+    self, AppState, ComposerTarget, FlatKind, HoverRegion, IntraRange, LineKey, Mode,
+};
 use crate::diff::{FileStatus, LineKind};
 use crate::syntax::Span as HSpan;
+use chrono::{DateTime, Utc};
 use ratatui::Frame;
 use ratatui::layout::{Constraint, Direction, Layout, Rect};
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Borders, Clear, Padding, Paragraph, Wrap};
 use tui_textarea::TextArea;
+
+/// Push a hover region for a timestamp at the given absolute screen position.
+/// `col_start` and `len` are character counts, not byte offsets — the title
+/// rendering uses `chars().count()` so this stays consistent.
+fn register_timestamp_hover(
+    state: &AppState,
+    row: u16,
+    col_start: usize,
+    len: usize,
+    created_at: &DateTime<Utc>,
+) {
+    if len == 0 {
+        return;
+    }
+    let col_start = col_start.min(u16::MAX as usize) as u16;
+    let col_end = (col_start as usize + len).min(u16::MAX as usize) as u16;
+    state.hover_regions.borrow_mut().push(HoverRegion {
+        row,
+        col_start,
+        col_end,
+        tooltip: app::format_absolute_local(created_at),
+    });
+}
 
 const ADD_BG: Color = Color::Rgb(20, 60, 30);
 const DEL_BG: Color = Color::Rgb(80, 25, 25);
@@ -16,6 +42,10 @@ const HEADER_BG: Color = Color::Rgb(40, 44, 60);
 const BORDER_FG: Color = Color::Rgb(80, 90, 110);
 
 pub fn draw(f: &mut Frame, state: &mut AppState, composer: Option<&mut TextArea<'_>>) {
+    // Hover regions are repopulated each frame by the render passes that draw
+    // timestamps. Clear stale entries from the previous frame so dismissed UI
+    // elements (e.g. scrolled-off comments) don't keep firing tooltips.
+    state.hover_regions.borrow_mut().clear();
     // Keep the composer popup sized to its content (+ 2 border rows) so the
     // user sees the full comment while editing. Capped so it never overflows
     // the viewport.
@@ -35,7 +65,9 @@ pub fn draw(f: &mut Frame, state: &mut AppState, composer: Option<&mut TextArea<
             })
             .unwrap_or(1);
         let desired = (display_rows as u16).saturating_add(2);
-        let cap = (state.viewport_height as u16).saturating_sub(2).max(COMPOSER_MIN_H);
+        let cap = (state.viewport_height as u16)
+            .saturating_sub(2)
+            .max(COMPOSER_MIN_H);
         state.composer_height = desired.clamp(COMPOSER_MIN_H, cap);
     } else {
         state.composer_height = 0;
@@ -52,13 +84,13 @@ pub fn draw(f: &mut Frame, state: &mut AppState, composer: Option<&mut TextArea<
 
     draw_topbar(f, vert[0], state);
 
-    // horizontal split: [tree?] [body] [drafts?]
+    // horizontal split: [tree?] [body] [threads?]
     let mut constraints: Vec<Constraint> = Vec::new();
     if state.show_tree {
         constraints.push(Constraint::Length(30));
     }
     constraints.push(Constraint::Min(20));
-    if state.show_drafts_pane {
+    if state.show_threads_pane {
         constraints.push(Constraint::Length(40));
     }
     let h_chunks = Layout::default()
@@ -73,15 +105,15 @@ pub fn draw(f: &mut Frame, state: &mut AppState, composer: Option<&mut TextArea<
     }
     let body_area = h_chunks[idx];
     idx += 1;
-    if state.show_drafts_pane {
-        draw_drafts_pane(f, h_chunks[idx], state);
+    if state.show_threads_pane {
+        draw_threads_pane(f, h_chunks[idx], state);
     }
 
     state.viewport_height = body_area.height as usize;
     state.body_top = body_area.y;
     state.body_x = body_area.x;
     state.body_width = body_area.width;
-    // Re-flatten on first frame and on resize so wrapped-draft row counts
+    // Re-flatten on first frame and on resize so wrapped-thread row counts
     // match the body width currently in use.
     if state.flat_for_body_width != state.body_width {
         state.rebuild_flat();
@@ -114,6 +146,59 @@ pub fn draw(f: &mut Frame, state: &mut AppState, composer: Option<&mut TextArea<
             }
         }
     }
+
+    // Tooltip is drawn last so it floats over any other content. Only in
+    // Normal mode — modal popups (composer/help/picker) take precedence.
+    if state.mode == Mode::Normal {
+        draw_hover_tooltip(f, area, state);
+    }
+}
+
+/// If the mouse is currently over a registered hover region, draw the
+/// region's tooltip as a single-line floating label near the cursor. The
+/// label is rendered with `Clear` so it overlays the body cleanly.
+fn draw_hover_tooltip(f: &mut Frame, area: Rect, state: &AppState) {
+    let Some((mx, my)) = state.hover_pos else {
+        return;
+    };
+    let regions = state.hover_regions.borrow();
+    let Some(reg) = regions
+        .iter()
+        .find(|r| r.row == my && mx >= r.col_start && mx < r.col_end)
+    else {
+        return;
+    };
+    // `tooltip` already has the timezone suffix baked in; pad with one space
+    // on each side for breathing room inside the highlight.
+    let label = format!(" {} ", reg.tooltip);
+    let label_w = label.chars().count() as u16;
+    if label_w == 0 || area.width == 0 || area.height == 0 {
+        return;
+    }
+    // Prefer placing the tooltip on the row directly below the timestamp,
+    // anchored so it starts at the timestamp's left edge. If we're against
+    // the bottom of the viewport, flip it above instead.
+    let tip_y = if reg.row + 1 < area.y + area.height {
+        reg.row + 1
+    } else {
+        reg.row.saturating_sub(1)
+    };
+    let max_x = area.x + area.width.saturating_sub(label_w);
+    let tip_x = reg.col_start.min(max_x);
+    let tip_w = label_w.min(area.x + area.width - tip_x);
+    let popup = Rect {
+        x: tip_x,
+        y: tip_y,
+        width: tip_w,
+        height: 1,
+    };
+    f.render_widget(Clear, popup);
+    let style = Style::default()
+        .fg(Color::Rgb(20, 24, 32))
+        .bg(Color::Rgb(220, 200, 110))
+        .add_modifier(Modifier::BOLD);
+    let p = Paragraph::new(Line::from(Span::styled(label, style)));
+    f.render_widget(p, popup);
 }
 
 fn draw_tree(f: &mut Frame, area: Rect, state: &AppState) {
@@ -152,19 +237,27 @@ fn draw_tree(f: &mut Frame, area: Rect, state: &AppState) {
             Span::styled(format!(" {mark} "), Style::default().fg(Color::Green)),
             Span::styled(
                 format!("{badge} "),
-                Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD),
+                Style::default()
+                    .fg(Color::Yellow)
+                    .add_modifier(Modifier::BOLD),
             ),
             Span::styled(path_short, path_style),
-            Span::styled(format!("  +{}", file.additions), Style::default().fg(Color::Green)),
-            Span::styled(format!(" −{}", file.deletions), Style::default().fg(Color::Red)),
+            Span::styled(
+                format!("  +{}", file.additions),
+                Style::default().fg(Color::Green),
+            ),
+            Span::styled(
+                format!(" −{}", file.deletions),
+                Style::default().fg(Color::Red),
+            ),
         ]));
     }
     let p = Paragraph::new(lines);
     f.render_widget(p, inner);
 }
 
-fn draw_drafts_pane(f: &mut Frame, area: Rect, state: &AppState) {
-    let title = format!(" Drafts ({}) ", state.drafts.len());
+fn draw_threads_pane(f: &mut Frame, area: Rect, state: &AppState) {
+    let title = format!(" Threads ({}) ", state.threads.len());
     let block = Block::default()
         .borders(Borders::ALL)
         .title(title)
@@ -172,9 +265,9 @@ fn draw_drafts_pane(f: &mut Frame, area: Rect, state: &AppState) {
     let inner = block.inner(area);
     f.render_widget(block, area);
 
-    if state.drafts.is_empty() {
+    if state.threads.is_empty() {
         let hint = Paragraph::new(Line::from(Span::styled(
-            "no drafts yet — click a line or press c to comment",
+            "no threads yet — click a line or press c to comment",
             Style::default().fg(Color::DarkGray),
         )))
         .wrap(Wrap { trim: false });
@@ -183,8 +276,8 @@ fn draw_drafts_pane(f: &mut Frame, area: Rect, state: &AppState) {
     }
 
     let mut lines: Vec<Line<'static>> = Vec::new();
-    for (i, d) in state.drafts.iter().enumerate() {
-        let selected = i == state.drafts_cursor;
+    for (i, d) in state.threads.iter().enumerate() {
+        let selected = i == state.threads_cursor;
         let anchor = d.anchor_label();
         let (status, status_color) = if d.resolved {
             ("✓ resolved", Color::Green)
@@ -205,7 +298,9 @@ fn draw_drafts_pane(f: &mut Frame, area: Rect, state: &AppState) {
         lines.push(Line::from(vec![
             Span::styled(
                 format!(" {status} "),
-                Style::default().fg(status_color).add_modifier(Modifier::BOLD),
+                Style::default()
+                    .fg(status_color)
+                    .add_modifier(Modifier::BOLD),
             ),
             Span::styled(format!("{path_short} · {anchor}"), header_style),
         ]));
@@ -233,14 +328,13 @@ fn draw_drafts_pane(f: &mut Frame, area: Rect, state: &AppState) {
         for sug in suggestions.iter().take(1) {
             lines.push(Line::from(Span::styled(
                 "    ┃ suggested change:",
-                Style::default().fg(Color::Rgb(100, 180, 110)).add_modifier(Modifier::ITALIC),
+                Style::default()
+                    .fg(Color::Rgb(100, 180, 110))
+                    .add_modifier(Modifier::ITALIC),
             )));
             for sline in sug.lines().take(3) {
                 lines.push(Line::from(vec![
-                    Span::styled(
-                        "    ┃ ",
-                        Style::default().fg(Color::Rgb(100, 180, 110)),
-                    ),
+                    Span::styled("    ┃ ", Style::default().fg(Color::Rgb(100, 180, 110))),
                     Span::styled(
                         format!("+ {sline}"),
                         Style::default()
@@ -262,11 +356,20 @@ fn draw_drafts_pane(f: &mut Frame, area: Rect, state: &AppState) {
 }
 
 fn draw_picker(f: &mut Frame, area: Rect, state: &AppState) {
-    let w = (area.width * 2 / 3).max(50).min(area.width.saturating_sub(4));
-    let h = (area.height * 2 / 3).max(12).min(area.height.saturating_sub(4));
+    let w = (area.width * 2 / 3)
+        .max(50)
+        .min(area.width.saturating_sub(4));
+    let h = (area.height * 2 / 3)
+        .max(12)
+        .min(area.height.saturating_sub(4));
     let x = area.x + (area.width.saturating_sub(w)) / 2;
     let y = area.y + (area.height.saturating_sub(h)) / 2;
-    let popup = Rect { x, y, width: w, height: h };
+    let popup = Rect {
+        x,
+        y,
+        width: w,
+        height: h,
+    };
     f.render_widget(Clear, popup);
 
     let block = Block::default()
@@ -314,8 +417,14 @@ fn draw_picker(f: &mut Frame, area: Rect, state: &AppState) {
         lines.push(Line::from(vec![
             Span::styled(prefix.to_string(), Style::default().fg(Color::Cyan)),
             Span::styled(file.path.clone(), style),
-            Span::styled(format!("  +{}", file.additions), Style::default().fg(Color::Green)),
-            Span::styled(format!(" −{}", file.deletions), Style::default().fg(Color::Red)),
+            Span::styled(
+                format!("  +{}", file.additions),
+                Style::default().fg(Color::Green),
+            ),
+            Span::styled(
+                format!(" −{}", file.deletions),
+                Style::default().fg(Color::Red),
+            ),
         ]));
     }
     f.render_widget(Paragraph::new(lines), parts[1]);
@@ -353,22 +462,22 @@ fn shorten_path(p: &str, width: usize) -> String {
 }
 
 fn draw_topbar(f: &mut Frame, area: Rect, state: &AppState) {
-    let open_drafts = state.drafts.iter().filter(|d| !d.resolved).count();
-    let outdated = state.drafts.iter().filter(|d| d.outdated).count();
+    let open_threads = state.threads.iter().filter(|d| !d.resolved).count();
+    let outdated = state.threads.iter().filter(|d| d.outdated).count();
     let outdated_str = if outdated > 0 {
         format!(" · {outdated} outdated")
     } else {
         String::new()
     };
     let title = format!(
-        " gitdiff · {} · {} files ({}/{} viewed) · +{} −{} · {} drafts{} · verdict: {} ",
+        " gitdiff · {} · {} files ({}/{} viewed) · +{} −{} · {} threads{} · verdict: {} ",
         state.source_label,
         state.files.len(),
         state.viewed_count(),
         state.files.len(),
         state.total_additions,
         state.total_deletions,
-        open_drafts,
+        open_threads,
         outdated_str,
         state.verdict.label()
     );
@@ -392,10 +501,10 @@ fn draw_footer(f: &mut Frame, area: Rect, state: &AppState) {
             "selection · c comment · y copy · esc clear · click elsewhere clears"
         }
         Mode::Normal => {
-            "j/k · ]/[ file · }/{ hunk · n next-reply · e tree · t pick · R drafts · v viewed · y yank · c comment · S submit · ? help · q quit"
+            "j/k · ]/[ file · }/{ hunk · n next-reply · e tree · t pick · R threads · v viewed · y yank · c comment · S submit · ? help · q quit"
         }
         Mode::Composing => match state.composer_target {
-            Some(ComposerTarget::EditDraft(_)) => {
+            Some(ComposerTarget::EditThread(_)) => {
                 "enter save · shift-enter newline · ctrl-d delete · esc cancel"
             }
             _ => "enter save · shift-enter newline · esc cancel",
@@ -480,12 +589,17 @@ fn draw_body(f: &mut Frame, area: Rect, state: &AppState) {
                 fl.line_idx.unwrap_or(20),
                 width,
             ),
-            FlatKind::DraftRow => render_draft_row(
-                state,
-                fl.draft_idx.unwrap_or(0),
-                fl.line_idx.unwrap_or(0),
-                width,
-            ),
+            FlatKind::ThreadRow => {
+                let screen_row = content_area.y + (ext_i - from) as u16;
+                render_thread_row(
+                    state,
+                    fl.thread_idx.unwrap_or(0),
+                    fl.line_idx.unwrap_or(0),
+                    width,
+                    screen_row,
+                    content_area.x,
+                )
+            }
             FlatKind::Spacer => Line::from(""),
         };
         let in_selection = sel_range.map(|(a, b)| i >= a && i <= b).unwrap_or(false);
@@ -565,13 +679,20 @@ fn draw_selection_menu(f: &mut Frame, body: Rect, state: &AppState) -> Option<Re
     let x = body.x + body.width.saturating_sub(total_width + 1);
     // Prefer one row below the selection end; clamp to body bottom.
     let row_below = if end >= state.scroll {
-        body.y.saturating_add((end - state.scroll) as u16).saturating_add(1)
+        body.y
+            .saturating_add((end - state.scroll) as u16)
+            .saturating_add(1)
     } else {
         body.y
     };
     let max_y = body.y + body.height.saturating_sub(1);
     let y = row_below.min(max_y);
-    let rect = Rect { x, y, width: total_width, height: 1 };
+    let rect = Rect {
+        x,
+        y,
+        width: total_width,
+        height: 1,
+    };
 
     f.render_widget(Clear, rect);
     let bg = Color::Rgb(40, 50, 70);
@@ -583,9 +704,16 @@ fn draw_selection_menu(f: &mut Frame, body: Rect, state: &AppState) -> Option<Re
     let gap_style = Style::default().bg(Color::Reset);
 
     let mut spans: Vec<Span<'static>> = Vec::new();
-    for (i, ((word, _), _)) in SELECTION_MENU_BUTTONS.iter().zip(buttons.iter()).enumerate() {
+    for (i, ((word, _), _)) in SELECTION_MENU_BUTTONS
+        .iter()
+        .zip(buttons.iter())
+        .enumerate()
+    {
         if i > 0 {
-            spans.push(Span::styled(" ".repeat(SELECTION_MENU_GAP as usize), gap_style));
+            spans.push(Span::styled(
+                " ".repeat(SELECTION_MENU_GAP as usize),
+                gap_style,
+            ));
         }
         spans.push(Span::styled("[ ", border_style));
         spans.push(Span::styled((*word).to_string(), text_style));
@@ -599,35 +727,32 @@ fn draw_selection_menu(f: &mut Frame, body: Rect, state: &AppState) -> Option<Re
 /// Returns (extended_position, height) of the composer-induced gap.
 /// `(0, 0)` when the composer is not open.
 ///
-/// For `NewDraft` / `EditDraft` the gap sits right after the *last* selected
-/// line — the draft is hidden so the composer takes its slot. For reply
+/// For `NewThread` / `EditThread` the gap sits right after the *last* selected
+/// line — the thread is hidden so the composer takes its slot. For reply
 /// targets the thread stays visible and the gap is placed just below the
-/// draft's bottom border so the user can still read the conversation while
+/// thread's bottom border so the user can still read the conversation while
 /// they type.
 fn composer_gap(state: &AppState) -> (usize, usize) {
     if state.mode != Mode::Composing {
         return (0, 0);
     }
     let h = state.composer_height.max(COMPOSER_MIN_H) as usize;
-    // Reply targets: find the last DraftRow of the attached draft and place
+    // Reply targets: find the last ThreadRow of the attached thread and place
     // the gap right after it.
-    if let Some(ComposerTarget::NewReply(idx) | ComposerTarget::EditReply { draft_idx: idx, .. }) =
-        state.composer_target
+    if let Some(
+        ComposerTarget::NewReply(idx)
+        | ComposerTarget::EditReply {
+            thread_idx: idx, ..
+        },
+    ) = state.composer_target
     {
-        if let Some(last) = state
-            .flat
-            .iter()
-            .enumerate()
-            .rev()
-            .find_map(|(i, fl)| (fl.kind == FlatKind::DraftRow && fl.draft_idx == Some(idx)).then_some(i))
-        {
+        if let Some(last) = state.flat.iter().enumerate().rev().find_map(|(i, fl)| {
+            (fl.kind == FlatKind::ThreadRow && fl.thread_idx == Some(idx)).then_some(i)
+        }) {
             return (last + 1, h);
         }
     }
-    let anchor = state
-        .selection
-        .map(|s| s.range().1)
-        .unwrap_or(state.cursor);
+    let anchor = state.selection.map(|s| s.range().1).unwrap_or(state.cursor);
     (anchor + 1, h)
 }
 
@@ -681,10 +806,18 @@ fn render_file_header(state: &AppState, fi: usize, width: usize) -> Line<'static
         FileStatus::Copied => ("C", Style::default().fg(Color::Black).bg(Color::Blue)),
     };
 
-    let header_bg = if viewed { Color::Rgb(28, 32, 42) } else { HEADER_BG };
+    let header_bg = if viewed {
+        Color::Rgb(28, 32, 42)
+    } else {
+        HEADER_BG
+    };
     let bg = Style::default().bg(header_bg);
     let border = Style::default().fg(BORDER_FG).bg(header_bg);
-    let path_fg = if viewed { Color::Rgb(120, 130, 150) } else { Color::White };
+    let path_fg = if viewed {
+        Color::Rgb(120, 130, 150)
+    } else {
+        Color::White
+    };
 
     let mut spans = vec![
         Span::styled("╭".to_string(), border),
@@ -711,16 +844,17 @@ fn render_file_header(state: &AppState, fi: usize, width: usize) -> Line<'static
         bg.fg(Color::Green),
     ));
     spans.push(Span::styled(" ", bg));
-    spans.push(Span::styled(
-        format!("−{}", f.deletions),
-        bg.fg(Color::Red),
-    ));
+    spans.push(Span::styled(format!("−{}", f.deletions), bg.fg(Color::Red)));
     if f.binary {
         spans.push(Span::styled(" [binary]", bg.fg(Color::DarkGray)));
     }
 
     // right-aligned "viewed" indicator: pad first, then the badge
-    let viewed_badge = if viewed { " ✓ viewed " } else { " ☐ viewed " };
+    let viewed_badge = if viewed {
+        " ✓ viewed "
+    } else {
+        " ☐ viewed "
+    };
     let viewed_style = if viewed {
         bg.fg(Color::Green).add_modifier(Modifier::BOLD)
     } else {
@@ -777,7 +911,13 @@ fn render_expand_btn(above: bool, count: usize, width: usize) -> Line<'static> {
     let glyph_fg = Color::Rgb(180, 200, 230);
     let label_fg = Color::Rgb(150, 170, 200);
     let chevron = if above { "▲" } else { "▼" };
-    let action = if count > 20 { "expand all" } else if above { "expand 20 above" } else { "expand 20 below" };
+    let action = if count > 20 {
+        "expand all"
+    } else if above {
+        "expand 20 above"
+    } else {
+        "expand 20 below"
+    };
     let label = if count <= 20 && count > 0 && count < 20 {
         format!("  {chevron} expand {count}  ")
     } else if count > 20 {
@@ -789,7 +929,11 @@ fn render_expand_btn(above: bool, count: usize, width: usize) -> Line<'static> {
     let pad = width.saturating_sub(label.chars().count() + 2);
     Line::from(vec![
         Span::styled("│".to_string(), border),
-        Span::styled(label, body.fg(Color::Rgb(180, 200, 230)).add_modifier(Modifier::BOLD)),
+        Span::styled(
+            label,
+            body.fg(Color::Rgb(180, 200, 230))
+                .add_modifier(Modifier::BOLD),
+        ),
         Span::styled(" ".repeat(pad), body),
         Span::styled("│".to_string(), border),
     ])
@@ -806,9 +950,13 @@ fn render_code_line(
     let hunk = &file.hunks[hi];
     let l = &hunk.lines[li];
 
-    let cover = state.draft_covering_line(fi, l);
-    let draft_at = cover.and_then(|(idx, is_anchor)| {
-        if is_anchor { state.drafts.get(idx) } else { None }
+    let cover = state.thread_covering_line(fi, l);
+    let thread_at = cover.and_then(|(idx, is_anchor)| {
+        if is_anchor {
+            state.threads.get(idx)
+        } else {
+            None
+        }
     });
     let in_range = cover.is_some();
 
@@ -818,10 +966,10 @@ fn render_code_line(
         LineKind::Context => (Color::Reset, Color::DarkGray),
     };
     let bg_style = Style::default().bg(bg);
-    // In-range lines wear yellow borders so a multi-line draft visually frames
-    // the lines it covers, joining up with the embedded draft box.
-    let range_draft = cover.and_then(|(idx, _)| state.drafts.get(idx));
-    let border_color = match range_draft {
+    // In-range lines wear yellow borders so a multi-line thread visually frames
+    // the lines it covers, joining up with the embedded thread box.
+    let range_thread = cover.and_then(|(idx, _)| state.threads.get(idx));
+    let border_color = match range_thread {
         Some(d) if d.resolved => Color::Green,
         Some(d) if d.outdated => Color::Rgb(220, 160, 50),
         Some(d) if app::needs_attention(d) => Color::Rgb(200, 130, 230),
@@ -845,7 +993,7 @@ fn render_code_line(
     };
     // Anchor row gets the status glyph; non-anchor rows in the range get a
     // continuation bar so the eye tracks the run from the anchor down.
-    let mark = match (draft_at, in_range) {
+    let mark = match (thread_at, in_range) {
         (Some(d), _) if d.resolved => '✓',
         (Some(d), _) if d.outdated => '!',
         (Some(_), _) => '◆',
@@ -860,15 +1008,9 @@ fn render_code_line(
             format!(" {mark} "),
             bg_style.fg(mark_color).add_modifier(Modifier::BOLD),
         ),
-        Span::styled(
-            old_g,
-            bg_style.fg(Color::Rgb(110, 120, 140)),
-        ),
+        Span::styled(old_g, bg_style.fg(Color::Rgb(110, 120, 140))),
         Span::styled(" ", bg_style),
-        Span::styled(
-            new_g,
-            bg_style.fg(Color::Rgb(110, 120, 140)),
-        ),
+        Span::styled(new_g, bg_style.fg(Color::Rgb(110, 120, 140))),
         Span::styled(
             format!(" {sign} "),
             bg_style.fg(sign_color).add_modifier(Modifier::BOLD),
@@ -922,7 +1064,11 @@ fn render_expanded_line(
         Some(e) => e,
         None => return Line::from(""),
     };
-    let l = if above { exp.above.get(li) } else { exp.below.get(li) };
+    let l = if above {
+        exp.above.get(li)
+    } else {
+        exp.below.get(li)
+    };
     let l = match l {
         Some(l) => l,
         None => return Line::from(""),
@@ -960,11 +1106,22 @@ fn render_expanded_line(
     Line::from(spans)
 }
 
-/// Renders a draft as a read-only mirror of the composer Block: yellow border,
+/// Renders a thread as a read-only mirror of the composer Block: yellow border,
 /// dark-blue interior, title on the top edge. Clicking transitions to the real
 /// composer, so the visual layout is unchanged — just a cursor appears.
-fn render_draft_row(state: &AppState, draft_idx: usize, sub: usize, width: usize) -> Line<'static> {
-    let d = match state.drafts.get(draft_idx) {
+///
+/// `screen_row` / `origin_x` describe where this sub-row lands on screen so we
+/// can register hover regions over the timestamp text (the absolute date+tz
+/// pops in a tooltip when the mouse is over the "5m ago" label).
+fn render_thread_row(
+    state: &AppState,
+    thread_idx: usize,
+    sub: usize,
+    width: usize,
+    screen_row: u16,
+    origin_x: u16,
+) -> Line<'static> {
+    let d = match state.threads.get(thread_idx) {
         Some(d) => d,
         None => return Line::from(""),
     };
@@ -974,7 +1131,11 @@ fn render_draft_row(state: &AppState, draft_idx: usize, sub: usize, width: usize
     const BOX_BG: Color = Color::Rgb(20, 28, 40);
     const ATTN_BOX_BG: Color = Color::Rgb(36, 24, 48);
     let box_bg = if attn { ATTN_BOX_BG } else { BOX_BG };
-    let frame_fg = if attn { Color::Rgb(200, 130, 230) } else { Color::Yellow };
+    let frame_fg = if attn {
+        Color::Rgb(200, 130, 230)
+    } else {
+        Color::Yellow
+    };
     let border = Style::default().fg(frame_fg).bg(box_bg);
     let bg = Style::default().bg(box_bg);
     let text = bg.fg(Color::Rgb(220, 230, 245));
@@ -1008,11 +1169,23 @@ fn render_draft_row(state: &AppState, draft_idx: usize, sub: usize, width: usize
         } else {
             ("◆ open", Color::Yellow)
         };
-        let ts = d.created_at.format("%Y-%m-%d %H:%M").to_string();
+        let now = Utc::now();
+        let ts = app::format_relative_time(&d.created_at, &now);
         let title_prefix = " ";
-        let title_suffix = format!(" · {ts} ");
-        let title_chars =
-            title_prefix.chars().count() + status_txt.chars().count() + title_suffix.chars().count();
+        let pre = " · ";
+        let post = " ";
+        // Columns: "┌" + " " + status_txt + " · " + ts + " " ...
+        let ts_col_start = origin_x as usize
+            + 1
+            + title_prefix.chars().count()
+            + status_txt.chars().count()
+            + pre.chars().count();
+        let ts_len = ts.chars().count();
+        register_timestamp_hover(state, screen_row, ts_col_start, ts_len, &d.created_at);
+        let title_suffix = format!("{pre}{ts}{post}");
+        let title_chars = title_prefix.chars().count()
+            + status_txt.chars().count()
+            + title_suffix.chars().count();
         let dashes = inner_w.saturating_sub(title_chars);
         return Line::from(vec![
             Span::styled("┌".to_string(), border),
@@ -1059,14 +1232,27 @@ fn render_draft_row(state: &AppState, draft_idx: usize, sub: usize, width: usize
     idx_in_body -= body_count;
 
     // Walk replies to find the (reply_idx, row_within_reply) for this sub.
+    let now = Utc::now();
     for (ri, wrap) in reply_wraps.iter().enumerate() {
         let block = 1 + wrap.len().max(1);
         if idx_in_body < block {
             let reply = &d.replies[ri];
             if idx_in_body == 0 {
-                // Reply header: `├─ @author · 2026-05-24 17:05 ─...─┤`
-                let ts = reply.created_at.format("%Y-%m-%d %H:%M").to_string();
-                let header = format!(" ↳ @{} · {} ", reply.author, ts);
+                // Reply header: `├─ @author · 5m ago ─...─┤`
+                let ts = app::format_relative_time(&reply.created_at, &now);
+                let prefix = format!(" ↳ @{} · ", reply.author);
+                let header = format!("{prefix}{ts} ");
+                // ts column: 1 ("├") + chars(prefix). Total absolute column on
+                // screen needs origin_x.
+                let ts_col_start = origin_x as usize + 1 + prefix.chars().count();
+                let ts_len = ts.chars().count();
+                register_timestamp_hover(
+                    state,
+                    screen_row,
+                    ts_col_start,
+                    ts_len,
+                    &reply.created_at,
+                );
                 let header_chars = header.chars().count();
                 let dashes = inner_w.saturating_sub(header_chars);
                 return Line::from(vec![
@@ -1135,10 +1321,7 @@ fn apply_intraline(
             }
             if split_b > split_a {
                 let mid: String = chars[split_a..split_b].iter().collect();
-                let bold_style = s
-                    .style
-                    .bg(emphasis_bg)
-                    .add_modifier(Modifier::BOLD);
+                let bold_style = s.style.bg(emphasis_bg).add_modifier(Modifier::BOLD);
                 out.push(Span::styled(mid, bold_style));
             }
             if split_b < len {
@@ -1172,7 +1355,7 @@ const SELECTION_BG: Color = Color::Rgb(50, 80, 135);
 
 /// Initial / minimum height of the inline composer popup (rows, including
 /// the 2 border rows). 3 = top border + 1 content row + bottom border, which
-/// matches the read-only draft view's height for a single-line comment. The
+/// matches the read-only thread view's height for a single-line comment. The
 /// height grows with the body content so the full comment fits.
 pub const COMPOSER_MIN_H: u16 = 3;
 
@@ -1258,11 +1441,7 @@ fn wrapped_row_count(line: &str, max_w: usize) -> usize {
         return 1;
     }
     let n = line.chars().count();
-    if n == 0 {
-        1
-    } else {
-        (n + max_w - 1) / max_w
-    }
+    if n == 0 { 1 } else { (n + max_w - 1) / max_w }
 }
 
 const COMPOSER_BG: Color = Color::Rgb(20, 28, 40);
@@ -1276,7 +1455,7 @@ fn draw_composer(f: &mut Frame, popup: Rect, state: &AppState, ta: &mut TextArea
         .title(title)
         .border_style(Style::default().fg(Color::Yellow))
         .style(Style::default().bg(COMPOSER_BG))
-        // Match the read-only draft view, which leaves a 1-col gap between
+        // Match the read-only thread view, which leaves a 1-col gap between
         // the border and the body text.
         .padding(Padding::horizontal(1));
     let inner = block.inner(popup);
@@ -1458,7 +1637,7 @@ fn build_composer_title(state: &AppState) -> String {
         format!("L{start}")
     };
     let (verb, delete_hint) = match state.composer_target {
-        Some(ComposerTarget::EditDraft(_)) => ("Edit comment", " · ctrl-d delete"),
+        Some(ComposerTarget::EditThread(_)) => ("Edit comment", " · ctrl-d delete"),
         Some(ComposerTarget::EditReply { .. }) => ("Edit reply", ""),
         Some(ComposerTarget::NewReply(_)) => ("Reply to thread", ""),
         _ => ("Comment", ""),
@@ -1500,7 +1679,7 @@ fn draw_help(f: &mut Frame, area: Rect) {
         Line::from("  v            toggle viewed (auto-collapses)"),
         Line::from("  y            yank current file path to clipboard"),
         Line::from("  e            toggle file tree sidebar"),
-        Line::from("  R            toggle drafts pane"),
+        Line::from("  R            toggle threads pane"),
         Line::from("  t            fuzzy file picker"),
         Line::from(""),
         Line::from("  w            toggle ignore-whitespace"),
@@ -1508,7 +1687,7 @@ fn draw_help(f: &mut Frame, area: Rect) {
         Line::from("  , / .        decrease / increase tab width"),
         Line::from(""),
         Line::from("  r            toggle resolved (on a commented line)"),
-        Line::from("  K / 0        add reaction / clear reactions (on a draft)"),
+        Line::from("  K / 0        add reaction / clear reactions (on a thread)"),
         Line::from("  V            cycle review verdict (comment / approve / request changes)"),
         Line::from(""),
         Line::from("  c            add / edit comment on current line"),
@@ -1517,14 +1696,16 @@ fn draw_help(f: &mut Frame, area: Rect) {
         Line::from("  n            jump to next thread where last reply isn't yours"),
         Line::from("  x            delete comment on current line"),
         Line::from("  ctrl-d       delete comment from edit mode (in composer)"),
-        Line::from("  S            submit drafts → REVIEW.md at repo root"),
+        Line::from("  S            submit threads → REVIEW.md at repo root"),
         Line::from("               (agents may reply inside <!-- replies:tID --> blocks;"),
         Line::from("                replies are merged back on next launch)"),
         Line::from(""),
-        Line::from("  mouse        click to move cursor, click header to collapse, wheel to scroll"),
+        Line::from(
+            "  mouse        click to move cursor, click header to collapse, wheel to scroll",
+        ),
         Line::from(""),
         Line::from("  ?            toggle this help"),
-        Line::from("  q            quit (drafts auto-persist to .gitdiff/drafts.json)"),
+        Line::from("  q            quit (threads auto-persist to .gitdiff/threads.json)"),
     ];
     let block = Block::default()
         .borders(Borders::ALL)

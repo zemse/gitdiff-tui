@@ -1,8 +1,9 @@
 use crate::diff::{DiffLine, FileDiff, Hunk, LineKind};
 use crate::git::{DiffOpts, DiffSource};
 use crate::syntax::{Highlighter, Span as HSpan};
-use chrono::{DateTime, Utc};
+use chrono::{DateTime, Local, Utc};
 use serde::{Deserialize, Serialize};
+use std::cell::RefCell;
 use std::collections::{HashMap, HashSet};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -15,10 +16,10 @@ pub enum FlatKind {
     ExpandedBelow,
     ExpandBtnAbove,
     ExpandBtnBelow,
-    // Inline rendering of a draft anchored to the Code row above. `line_idx`
-    // selects which sub-row of the draft is being rendered (0 = header,
+    // Inline rendering of a thread anchored to the Code row above. `line_idx`
+    // selects which sub-row of the thread is being rendered (0 = header,
     // 1..N = body lines, N+1 = reactions if any).
-    DraftRow,
+    ThreadRow,
     Spacer,
 }
 
@@ -28,11 +29,11 @@ pub struct FlatLine {
     pub file_idx: usize,
     pub hunk_idx: Option<usize>,
     pub line_idx: Option<usize>,
-    pub draft_idx: Option<usize>,
+    pub thread_idx: Option<usize>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct Draft {
+pub struct Thread {
     pub file_path: String,
     pub old_lineno: Option<usize>,
     pub new_lineno: Option<usize>,
@@ -51,7 +52,7 @@ pub struct Draft {
     #[serde(default)]
     pub reactions: Vec<String>,
     /// Stable identifier so agents can target a specific thread when replying
-    /// inside REVIEW-*.md. Empty on drafts loaded from pre-thread JSON; the
+    /// inside REVIEW-*.md. Empty on threads loaded from pre-thread JSON; the
     /// startup loader backfills any missing IDs.
     #[serde(default)]
     pub thread_id: String,
@@ -59,8 +60,8 @@ pub struct Draft {
     /// blocks on launch, then preserved through subsequent submits.
     #[serde(default)]
     pub replies: Vec<Reply>,
-    /// Verbatim text of the anchor line at the time the draft was created.
-    /// Used at launch to re-anchor the draft when surrounding code shifts the
+    /// Verbatim text of the anchor line at the time the thread was created.
+    /// Used at launch to re-anchor the thread when surrounding code shifts the
     /// line numbers — we search the new diff for this exact content and snap
     /// the lineno to the closest match.
     #[serde(default)]
@@ -84,7 +85,7 @@ pub const LOCAL_AUTHOR: &str = "you";
 /// A thread "needs your attention" when it's still open and the last message
 /// in the conversation isn't yours — i.e. an agent (or someone else) replied
 /// and you haven't responded.
-pub fn needs_attention(d: &Draft) -> bool {
+pub fn needs_attention(d: &Thread) -> bool {
     if d.resolved {
         return false;
     }
@@ -100,31 +101,30 @@ pub fn needs_attention(d: &Draft) -> bool {
 ///     new reply instead of editing.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ComposerTarget {
-    /// Brand-new comment on the current selection — no draft exists yet.
-    NewDraft,
+    /// Brand-new comment on the current selection — no thread exists yet.
+    NewThread,
     /// Editing the original comment body (only when no replies exist yet).
-    EditDraft(usize),
+    EditThread(usize),
     /// Editing your own last reply.
-    EditReply { draft_idx: usize, reply_idx: usize },
+    EditReply { thread_idx: usize, reply_idx: usize },
     /// Appending a fresh reply because the thread's last message isn't yours.
     NewReply(usize),
 }
 
 impl ComposerTarget {
-    /// Which draft (if any) should hide while the composer is open. Only
-    /// `EditDraft` hides the box — for reply targets the thread stays visible
+    /// Which thread (if any) should hide while the composer is open. Only
+    /// `EditThread` hides the box — for reply targets the thread stays visible
     /// so the user can see what they're responding to, and the composer
     /// renders just below it.
-    pub fn hides_draft(&self) -> Option<usize> {
+    pub fn hides_thread(&self) -> Option<usize> {
         match self {
-            ComposerTarget::EditDraft(idx) => Some(*idx),
+            ComposerTarget::EditThread(idx) => Some(*idx),
             _ => None,
         }
     }
-
 }
 
-impl Draft {
+impl Thread {
     pub fn anchor_label(&self) -> String {
         let a = self.new_lineno.or(self.old_lineno);
         let b = self.new_lineno_end.or(self.old_lineno_end);
@@ -208,6 +208,57 @@ pub struct IntraRange {
     pub suffix: usize,
 }
 
+/// On-screen region that should reveal a tooltip when the mouse hovers over it.
+/// Currently used by comment headers to expose the absolute timestamp behind
+/// the "5m ago" relative label.
+#[derive(Debug, Clone)]
+pub struct HoverRegion {
+    pub row: u16,
+    pub col_start: u16,
+    pub col_end: u16,
+    pub tooltip: String,
+}
+
+/// Compact "5s ago" / "12m ago" / "3h ago" / "4d ago" style label.
+/// Anchored to `now` so callers can pass an injected clock in tests.
+pub fn format_relative_time(dt: &DateTime<Utc>, now: &DateTime<Utc>) -> String {
+    let secs = now.signed_duration_since(*dt).num_seconds();
+    if secs < 0 {
+        // Clock skew or a future-dated record — fall back to a tiny label
+        // rather than confusing the reader with "-3s ago".
+        return "just now".to_string();
+    }
+    if secs < 5 {
+        return "just now".to_string();
+    }
+    if secs < 60 {
+        return format!("{secs}s ago");
+    }
+    let mins = secs / 60;
+    if mins < 60 {
+        return format!("{mins}m ago");
+    }
+    let hours = mins / 60;
+    if hours < 24 {
+        return format!("{hours}h ago");
+    }
+    let days = hours / 24;
+    format!("{days}d ago")
+}
+
+/// `2026-05-24 17:05 IST` (or with a `+05:30` offset suffix on platforms where
+/// `%Z` doesn't expand). Always in the user's local timezone so the displayed
+/// wall-clock matches what their other tools show.
+pub fn format_absolute_local(dt: &DateTime<Utc>) -> String {
+    let local = dt.with_timezone(&Local);
+    let tz = local.format("%Z").to_string();
+    if tz.is_empty() || tz == "%Z" {
+        local.format("%Y-%m-%d %H:%M %:z").to_string()
+    } else {
+        format!("{} {tz}", local.format("%Y-%m-%d %H:%M"))
+    }
+}
+
 pub struct AppState {
     pub source: DiffSource,
     pub source_label: String,
@@ -217,7 +268,7 @@ pub struct AppState {
     pub cursor: usize,
     pub scroll: usize,
     pub viewport_height: usize,
-    pub drafts: Vec<Draft>,
+    pub threads: Vec<Thread>,
     pub mode: Mode,
     pub status: Option<String>,
     pub should_quit: bool,
@@ -236,23 +287,23 @@ pub struct AppState {
     pub body_top: u16,
     pub viewed: HashMap<String, String>,
     pub show_tree: bool,
-    pub show_drafts_pane: bool,
+    pub show_threads_pane: bool,
     pub opts: DiffOpts,
     pub tab_width: usize,
     pub verdict: Verdict,
-    pub drafts_cursor: usize,
+    pub threads_cursor: usize,
     pub picker: Option<FuzzyPicker>,
     pub body_x: u16,
     pub body_width: u16,
     // Dynamic composer popup height (rows, includes borders). Set by ui::draw
     // each frame based on the TextArea's content. 0 when not composing.
     pub composer_height: u16,
-    // Index of the draft currently being edited in the composer. When Some,
-    // rebuild_flat hides that draft's rows so the composer replaces (not
+    // Index of the thread currently being edited in the composer. When Some,
+    // rebuild_flat hides that thread's rows so the composer replaces (not
     // duplicates) the rendered comment. Derived from `composer_target` each
     // time the composer opens; cleared on close.
-    pub editing_draft_idx: Option<usize>,
-    // What the open composer is targeting (new draft, edit, reply). Set in
+    pub editing_thread_idx: Option<usize>,
+    // What the open composer is targeting (new thread, edit, reply). Set in
     // `open_composer`, consulted by the save path and the composer chrome.
     pub composer_target: Option<ComposerTarget>,
     // Geometry of the composer popup as drawn last frame (x, y, w, h). Used to
@@ -262,12 +313,20 @@ pub struct AppState {
     // Used for hit-testing clicks on its buttons.
     pub selection_menu_rect: Option<(u16, u16, u16, u16)>,
     // `body_width` last used when computing `flat`. Drives a re-flatten on
-    // resize so draft sub-row counts match the new wrap.
+    // resize so thread sub-row counts match the new wrap.
     pub flat_for_body_width: u16,
     // mtime of REVIEW-*.md the last time we read or wrote it. The event loop
     // polls this every tick and re-imports replies if the file has changed
     // externally (e.g. an agent appended a `> [@...] ...` line).
     pub last_review_mtime: Option<std::time::SystemTime>,
+    // Last reported mouse position. Drives hover tooltips on comment
+    // timestamps. None until the user moves the mouse.
+    pub hover_pos: Option<(u16, u16)>,
+    // Screen regions registered during the current frame's render that should
+    // pop a tooltip when the mouse is over them. Cleared at the start of every
+    // frame, then re-populated by render passes. RefCell so the render
+    // functions can keep their `&AppState` signature.
+    pub hover_regions: RefCell<Vec<HoverRegion>>,
 }
 
 #[derive(Debug, Clone)]
@@ -281,11 +340,14 @@ impl AppState {
         source: DiffSource,
         source_label: String,
         files: Vec<FileDiff>,
-        drafts: Vec<Draft>,
+        threads: Vec<Thread>,
         viewed: HashMap<String, String>,
     ) -> Self {
         // viewed files start collapsed
-        let expanded: Vec<bool> = files.iter().map(|f| !viewed.contains_key(&f.path)).collect();
+        let expanded: Vec<bool> = files
+            .iter()
+            .map(|f| !viewed.contains_key(&f.path))
+            .collect();
         let flat = flatten(&files, &expanded, &HashMap::new());
         let total_additions = files.iter().map(|f| f.additions).sum();
         let total_deletions = files.iter().map(|f| f.deletions).sum();
@@ -300,7 +362,7 @@ impl AppState {
             cursor: 0,
             scroll: 0,
             viewport_height: 20,
-            drafts,
+            threads,
             mode: Mode::Normal,
             status: None,
             should_quit: false,
@@ -316,21 +378,23 @@ impl AppState {
             body_top: 1,
             viewed,
             show_tree: false,
-            show_drafts_pane: false,
+            show_threads_pane: false,
             opts: DiffOpts::default(),
             tab_width: 4,
             verdict: Verdict::Comment,
-            drafts_cursor: 0,
+            threads_cursor: 0,
             picker: None,
             body_x: 0,
             body_width: 80,
             composer_height: 0,
-            editing_draft_idx: None,
+            editing_thread_idx: None,
             composer_target: None,
             composer_rect: None,
             selection_menu_rect: None,
             flat_for_body_width: 0,
             last_review_mtime: None,
+            hover_pos: None,
+            hover_regions: RefCell::new(Vec::new()),
         };
         // start on first code line if possible
         if let Some(i) = s.flat.iter().position(|l| l.kind == FlatKind::Code) {
@@ -347,7 +411,7 @@ impl AppState {
                 file_idx: fi,
                 hunk_idx: None,
                 line_idx: None,
-                        draft_idx: None,
+                thread_idx: None,
             });
             if self.expanded.get(fi).copied().unwrap_or(true) {
                 for hi in 0..self.files[fi].hunks.len() {
@@ -356,7 +420,11 @@ impl AppState {
                     // user has folded it; no need to offer expanding context
                     // around something they explicitly hid).
                     let hunk_collapsed = self.collapsed_hunks.contains(&(fi, hi));
-                    let rem_above = if hunk_collapsed { 0 } else { self.remaining_above(fi, hi) };
+                    let rem_above = if hunk_collapsed {
+                        0
+                    } else {
+                        self.remaining_above(fi, hi)
+                    };
                     let emit_above_btn = if hi == 0 {
                         rem_above > 0
                     } else {
@@ -375,7 +443,7 @@ impl AppState {
                             file_idx: fi,
                             hunk_idx: Some(hi),
                             line_idx: Some(count),
-                        draft_idx: None,
+                            thread_idx: None,
                         });
                     }
 
@@ -387,7 +455,7 @@ impl AppState {
                         file_idx: fi,
                         hunk_idx: Some(hi),
                         line_idx: None,
-                        draft_idx: None,
+                        thread_idx: None,
                     });
 
                     // If this hunk is collapsed, skip the rest of its rows
@@ -405,24 +473,24 @@ impl AppState {
                                 file_idx: fi,
                                 hunk_idx: Some(hi),
                                 line_idx: Some(li),
-                        draft_idx: None,
+                                thread_idx: None,
                             });
                         }
                     }
 
-                    // -- code (with inline drafts attached) --
+                    // -- code (with inline threads attached) --
                     for li in 0..self.files[fi].hunks[hi].lines.len() {
                         out.push(FlatLine {
                             kind: FlatKind::Code,
                             file_idx: fi,
                             hunk_idx: Some(hi),
                             line_idx: Some(li),
-                            draft_idx: None,
+                            thread_idx: None,
                         });
-                        // emit any drafts anchored at this code line, inline
+                        // emit any threads anchored at this code line, inline
                         let line = &self.files[fi].hunks[hi].lines[li];
-                        let drafts_here: Vec<usize> = self
-                            .drafts
+                        let threads_here: Vec<usize> = self
+                            .threads
                             .iter()
                             .enumerate()
                             .filter(|(_, d)| {
@@ -432,42 +500,38 @@ impl AppState {
                             })
                             .map(|(i, _)| i)
                             .collect();
-                        for di in drafts_here {
-                            // Skip the draft currently being edited — the composer
+                        for ti in threads_here {
+                            // Skip the thread currently being edited — the composer
                             // popup renders in its place.
-                            if self.editing_draft_idx == Some(di) {
+                            if self.editing_thread_idx == Some(ti) {
                                 continue;
                             }
                             // Resolved threads are hidden from the inline TUI;
-                            // they still show in the side drafts pane and in
+                            // they still show in the side threads pane and in
                             // REVIEW-*.md's Resolved section.
-                            if self.drafts[di].resolved {
+                            if self.threads[ti].resolved {
                                 continue;
                             }
-                            let max_w = draft_text_width(self.body_width);
-                            let body_lines = wrap_body(&self.drafts[di].body, max_w)
-                                .len()
-                                .max(1);
-                            let has_react = !self.drafts[di].reactions.is_empty();
+                            let max_w = thread_text_width(self.body_width);
+                            let body_lines = wrap_body(&self.threads[ti].body, max_w).len().max(1);
+                            let has_react = !self.threads[ti].reactions.is_empty();
                             // Each reply contributes: 1 header divider row +
                             // its wrapped body rows.
-                            let reply_rows: usize = self.drafts[di]
+                            let reply_rows: usize = self.threads[ti]
                                 .replies
                                 .iter()
                                 .map(|r| 1 + wrap_body(&r.body, max_w).len().max(1))
                                 .sum();
                             // 2 border rows (top + bottom) + body + replies + optional reactions.
-                            let total_rows = 2
-                                + body_lines
-                                + reply_rows
-                                + if has_react { 1 } else { 0 };
+                            let total_rows =
+                                2 + body_lines + reply_rows + if has_react { 1 } else { 0 };
                             for sub in 0..total_rows {
                                 out.push(FlatLine {
-                                    kind: FlatKind::DraftRow,
+                                    kind: FlatKind::ThreadRow,
                                     file_idx: fi,
                                     hunk_idx: Some(hi),
                                     line_idx: Some(sub),
-                                    draft_idx: Some(di),
+                                    thread_idx: Some(ti),
                                 });
                             }
                         }
@@ -481,7 +545,7 @@ impl AppState {
                                 file_idx: fi,
                                 hunk_idx: Some(hi),
                                 line_idx: Some(li),
-                        draft_idx: None,
+                                thread_idx: None,
                             });
                         }
                     }
@@ -504,7 +568,7 @@ impl AppState {
                                 file_idx: fi,
                                 hunk_idx: Some(hi),
                                 line_idx: Some(count),
-                        draft_idx: None,
+                                thread_idx: None,
                             });
                         }
                     } else {
@@ -519,7 +583,7 @@ impl AppState {
                                 file_idx: fi,
                                 hunk_idx: Some(hi),
                                 line_idx: Some(combined),
-                        draft_idx: None,
+                                thread_idx: None,
                             });
                         } else if rem_below > 0 {
                             let count = 20.min(rem_below);
@@ -528,7 +592,7 @@ impl AppState {
                                 file_idx: fi,
                                 hunk_idx: Some(hi),
                                 line_idx: Some(count),
-                        draft_idx: None,
+                                thread_idx: None,
                             });
                         }
                     }
@@ -539,14 +603,14 @@ impl AppState {
                 file_idx: fi,
                 hunk_idx: None,
                 line_idx: None,
-                        draft_idx: None,
+                thread_idx: None,
             });
             out.push(FlatLine {
                 kind: FlatKind::Spacer,
                 file_idx: fi,
                 hunk_idx: None,
                 line_idx: None,
-                        draft_idx: None,
+                thread_idx: None,
             });
         }
         self.flat = out;
@@ -628,7 +692,10 @@ impl AppState {
 
     fn file_max_new_lineno(&self, fi: usize) -> Option<usize> {
         let path = self.files.get(fi)?.path.clone();
-        self.file_blobs.get(&path).and_then(|b| b.as_ref()).map(|v| v.len())
+        self.file_blobs
+            .get(&path)
+            .and_then(|b| b.as_ref())
+            .map(|v| v.len())
     }
 
     fn above_frontier_new(&self, fi: usize, hi: usize) -> usize {
@@ -712,7 +779,9 @@ impl AppState {
         count: usize,
         above: bool,
     ) -> usize {
-        let Some(_) = self.files.get(fi) else { return 0 };
+        let Some(_) = self.files.get(fi) else {
+            return 0;
+        };
         if hi >= self.files[fi].hunks.len() {
             return 0;
         }
@@ -735,10 +804,7 @@ impl AppState {
             for k in 0..added {
                 let nl = frontier_new - added + k;
                 let ol = frontier_old - added + k;
-                let content = lines
-                    .get(nl.saturating_sub(1))
-                    .cloned()
-                    .unwrap_or_default();
+                let content = lines.get(nl.saturating_sub(1)).cloned().unwrap_or_default();
                 prepend.push(DiffLine {
                     kind: LineKind::Context,
                     old_lineno: Some(ol),
@@ -783,10 +849,7 @@ impl AppState {
                 if nl > lines.len() {
                     break;
                 }
-                let content = lines
-                    .get(nl.saturating_sub(1))
-                    .cloned()
-                    .unwrap_or_default();
+                let content = lines.get(nl.saturating_sub(1)).cloned().unwrap_or_default();
                 append.push(DiffLine {
                     kind: LineKind::Context,
                     old_lineno: Some(ol),
@@ -805,7 +868,10 @@ impl AppState {
     }
 
     pub fn replace_files(&mut self, files: Vec<FileDiff>) {
-        let expanded: Vec<bool> = files.iter().map(|f| !self.viewed.contains_key(&f.path)).collect();
+        let expanded: Vec<bool> = files
+            .iter()
+            .map(|f| !self.viewed.contains_key(&f.path))
+            .collect();
         let total_additions = files.iter().map(|f| f.additions).sum();
         let total_deletions = files.iter().map(|f| f.deletions).sum();
         let highlights = precompute_highlights(&files);
@@ -837,9 +903,9 @@ impl AppState {
         }
     }
 
-    pub fn jump_to_draft(&mut self, draft_idx: usize) {
+    pub fn jump_to_thread(&mut self, thread_idx: usize) {
         // copy out the anchor data to release the immutable borrow before rebuild_flat
-        let (anchor_path, anchor_old, anchor_new) = match self.drafts.get(draft_idx) {
+        let (anchor_path, anchor_old, anchor_new) = match self.threads.get(thread_idx) {
             Some(d) => (d.file_path.clone(), d.old_lineno, d.new_lineno),
             None => return,
         };
@@ -946,16 +1012,16 @@ impl AppState {
     /// wrapping to the top if there is none after the cursor. Returns whether
     /// it actually moved.
     pub fn jump_next_thread_needing_attention(&mut self) -> bool {
-        // Build the list of flat indices that hold a draft anchor needing
+        // Build the list of flat indices that hold a thread anchor needing
         // attention, in document order. Then find the first one strictly
         // after the cursor; wrap to the first overall if none.
         let mut anchors: Vec<usize> = Vec::new();
         for (i, fl) in self.flat.iter().enumerate() {
-            if fl.kind != FlatKind::DraftRow || fl.line_idx != Some(0) {
+            if fl.kind != FlatKind::ThreadRow || fl.line_idx != Some(0) {
                 continue;
             }
-            let Some(di) = fl.draft_idx else { continue };
-            if let Some(d) = self.drafts.get(di) {
+            let Some(ti) = fl.thread_idx else { continue };
+            if let Some(d) = self.threads.get(ti) {
                 if needs_attention(d) {
                     anchors.push(i);
                 }
@@ -1017,8 +1083,12 @@ impl AppState {
 
     pub fn extend_selection(&mut self, idx: usize) {
         let Some(s) = self.selection else { return };
-        let Some(start_fl) = self.flat.get(s.start).cloned() else { return };
-        let Some(end_fl) = self.flat.get(idx).cloned() else { return };
+        let Some(start_fl) = self.flat.get(s.start).cloned() else {
+            return;
+        };
+        let Some(end_fl) = self.flat.get(idx).cloned() else {
+            return;
+        };
         if start_fl.file_idx != end_fl.file_idx {
             return;
         }
@@ -1044,7 +1114,9 @@ impl AppState {
     }
 
     pub fn selection_lines(&self) -> Vec<LineKey> {
-        let Some(s) = self.selection else { return Vec::new() };
+        let Some(s) = self.selection else {
+            return Vec::new();
+        };
         let (a, b) = s.range();
         (a..=b)
             .filter_map(|i| {
@@ -1066,7 +1138,12 @@ impl AppState {
         }
         let mut out = String::new();
         for (fi, hi, li) in keys {
-            if let Some(l) = self.files.get(fi).and_then(|f| f.hunks.get(hi)).and_then(|h| h.lines.get(li)) {
+            if let Some(l) = self
+                .files
+                .get(fi)
+                .and_then(|f| f.hunks.get(hi))
+                .and_then(|h| h.lines.get(li))
+            {
                 if !out.is_empty() {
                     out.push('\n');
                 }
@@ -1076,47 +1153,45 @@ impl AppState {
         Some(out)
     }
 
-    pub fn draft_for_selection(&self) -> Option<usize> {
+    pub fn thread_for_selection(&self) -> Option<usize> {
         let keys = self.selection_lines();
         let (fi, hi, li) = *keys.last()?;
         let file = self.files.get(fi)?;
         let line = file.hunks.get(hi)?.lines.get(li)?;
-        self.drafts.iter().position(|d| {
+        self.threads.iter().position(|d| {
             d.file_path == file.path
                 && d.new_lineno == line.new_lineno
                 && d.old_lineno == line.old_lineno
         })
     }
 
-    /// Returns `(draft_idx, is_anchor)` if `line` falls inside a draft's range.
-    /// `is_anchor` is true for the row the draft renders on; the anchor is the
+    /// Returns `(thread_idx, is_anchor)` if `line` falls inside a thread's range.
+    /// `is_anchor` is true for the row the thread renders on; the anchor is the
     /// *last* line of the original selection. The two stored linenos can
-    /// appear in either order across older drafts, so we treat the pair as an
+    /// appear in either order across older threads, so we treat the pair as an
     /// unordered min/max range when checking inclusion.
-    pub fn draft_covering_line(&self, fi: usize, line: &DiffLine) -> Option<(usize, bool)> {
+    pub fn thread_covering_line(&self, fi: usize, line: &DiffLine) -> Option<(usize, bool)> {
         let path = &self.files.get(fi)?.path;
-        self.drafts.iter().enumerate().find_map(|(idx, d)| {
+        self.threads.iter().enumerate().find_map(|(idx, d)| {
             if &d.file_path != path {
                 return None;
             }
             // Hidden from inline rendering when resolved — matches rebuild_flat
-            // (no DraftRow emitted), so the framing/marker must also be off.
+            // (no ThreadRow emitted), so the framing/marker must also be off.
             if d.resolved {
                 return None;
             }
             if d.old_lineno == line.old_lineno && d.new_lineno == line.new_lineno {
                 return Some((idx, true));
             }
-            if let (Some(a), Some(b), Some(ln)) =
-                (d.new_lineno, d.new_lineno_end, line.new_lineno)
+            if let (Some(a), Some(b), Some(ln)) = (d.new_lineno, d.new_lineno_end, line.new_lineno)
             {
                 let (lo, hi) = if a <= b { (a, b) } else { (b, a) };
                 if ln >= lo && ln <= hi {
                     return Some((idx, false));
                 }
             }
-            if let (Some(a), Some(b), Some(ln)) =
-                (d.old_lineno, d.old_lineno_end, line.old_lineno)
+            if let (Some(a), Some(b), Some(ln)) = (d.old_lineno, d.old_lineno_end, line.old_lineno)
             {
                 let (lo, hi) = if a <= b { (a, b) } else { (b, a) };
                 if ln >= lo && ln <= hi {
@@ -1127,9 +1202,9 @@ impl AppState {
         })
     }
 
-    pub fn draft_for_cursor(&self) -> Option<usize> {
+    pub fn thread_for_cursor(&self) -> Option<usize> {
         let (file, _, line) = self.current_line()?;
-        self.drafts.iter().position(|d| {
+        self.threads.iter().position(|d| {
             d.file_path == file.path
                 && d.new_lineno == line.new_lineno
                 && d.old_lineno == line.old_lineno
@@ -1140,19 +1215,19 @@ impl AppState {
     /// editing rules: you can only edit a message if it's yours and nothing
     /// follows it; otherwise the composer is a brand-new message.
     pub fn decide_composer_target(&self) -> ComposerTarget {
-        let Some(idx) = self.draft_for_selection() else {
-            return ComposerTarget::NewDraft;
+        let Some(idx) = self.thread_for_selection() else {
+            return ComposerTarget::NewThread;
         };
-        let d = &self.drafts[idx];
+        let d = &self.threads[idx];
         if d.replies.is_empty() {
             // The original comment is still the thread's last message. You wrote
             // it, so you can edit it.
-            ComposerTarget::EditDraft(idx)
+            ComposerTarget::EditThread(idx)
         } else {
             let last = d.replies.len() - 1;
             if d.replies[last].author == LOCAL_AUTHOR {
                 ComposerTarget::EditReply {
-                    draft_idx: idx,
+                    thread_idx: idx,
                     reply_idx: last,
                 }
             } else {
@@ -1165,18 +1240,18 @@ impl AppState {
     /// empty for new messages.
     pub fn initial_composer_body(&self, target: ComposerTarget) -> String {
         match target {
-            ComposerTarget::NewDraft | ComposerTarget::NewReply(_) => String::new(),
-            ComposerTarget::EditDraft(idx) => self
-                .drafts
+            ComposerTarget::NewThread | ComposerTarget::NewReply(_) => String::new(),
+            ComposerTarget::EditThread(idx) => self
+                .threads
                 .get(idx)
                 .map(|d| d.body.clone())
                 .unwrap_or_default(),
             ComposerTarget::EditReply {
-                draft_idx,
+                thread_idx,
                 reply_idx,
             } => self
-                .drafts
-                .get(draft_idx)
+                .threads
+                .get(thread_idx)
                 .and_then(|d| d.replies.get(reply_idx))
                 .map(|r| r.body.clone())
                 .unwrap_or_default(),
@@ -1186,9 +1261,9 @@ impl AppState {
     /// Commits `body` to whatever the open composer is targeting.
     pub fn save_composer(&mut self, target: ComposerTarget, body: String) -> bool {
         match target {
-            ComposerTarget::NewDraft => self.add_draft_from_selection(body).is_some(),
-            ComposerTarget::EditDraft(idx) => {
-                if let Some(d) = self.drafts.get_mut(idx) {
+            ComposerTarget::NewThread => self.add_thread_from_selection(body).is_some(),
+            ComposerTarget::EditThread(idx) => {
+                if let Some(d) = self.threads.get_mut(idx) {
                     d.body = body;
                     d.created_at = Utc::now();
                     true
@@ -1197,12 +1272,12 @@ impl AppState {
                 }
             }
             ComposerTarget::EditReply {
-                draft_idx,
+                thread_idx,
                 reply_idx,
             } => {
                 if let Some(r) = self
-                    .drafts
-                    .get_mut(draft_idx)
+                    .threads
+                    .get_mut(thread_idx)
                     .and_then(|d| d.replies.get_mut(reply_idx))
                 {
                     r.body = body;
@@ -1213,7 +1288,7 @@ impl AppState {
                 }
             }
             ComposerTarget::NewReply(idx) => {
-                if let Some(d) = self.drafts.get_mut(idx) {
+                if let Some(d) = self.threads.get_mut(idx) {
                     d.replies.push(Reply {
                         author: LOCAL_AUTHOR.to_string(),
                         body,
@@ -1227,7 +1302,7 @@ impl AppState {
         }
     }
 
-    pub fn add_draft_from_selection(&mut self, body: String) -> Option<()> {
+    pub fn add_thread_from_selection(&mut self, body: String) -> Option<()> {
         let keys = self.selection_lines();
         if keys.is_empty() {
             return None;
@@ -1236,12 +1311,7 @@ impl AppState {
         let file = self.files.get(fi)?.clone();
         let first_key = *keys.first()?;
         let last_key = *keys.last()?;
-        let first_line = file
-            .hunks
-            .get(first_key.1)?
-            .lines
-            .get(first_key.2)?
-            .clone();
+        let first_line = file.hunks.get(first_key.1)?.lines.get(first_key.2)?.clone();
         let last_line = file.hunks.get(last_key.1)?.lines.get(last_key.2)?.clone();
 
         let snippet = build_range_snippet(&file, &keys);
@@ -1265,16 +1335,16 @@ impl AppState {
             None
         };
 
-        if let Some(idx) = self.drafts.iter().position(|d| {
+        if let Some(idx) = self.threads.iter().position(|d| {
             d.file_path == file.path
                 && d.new_lineno == last_line.new_lineno
                 && d.old_lineno == last_line.old_lineno
         }) {
-            self.drafts[idx].body = body;
-            self.drafts[idx].created_at = Utc::now();
-            self.drafts[idx].old_lineno_end = other_old;
-            self.drafts[idx].new_lineno_end = other_new;
-            self.drafts[idx].diff_snippet = snippet;
+            self.threads[idx].body = body;
+            self.threads[idx].created_at = Utc::now();
+            self.threads[idx].old_lineno_end = other_old;
+            self.threads[idx].new_lineno_end = other_new;
+            self.threads[idx].diff_snippet = snippet;
             return Some(());
         }
         let created_at = Utc::now();
@@ -1284,7 +1354,7 @@ impl AppState {
             last_line.new_lineno,
             &created_at,
         );
-        self.drafts.push(Draft {
+        self.threads.push(Thread {
             file_path: file.path.clone(),
             old_lineno: last_line.old_lineno,
             new_lineno: last_line.new_lineno,
@@ -1305,50 +1375,52 @@ impl AppState {
     }
 
     pub fn add_reaction_at_cursor(&mut self) -> Option<String> {
-        let idx = self.draft_for_cursor()?;
-        let used: HashSet<&String> = self.drafts[idx].reactions.iter().collect();
+        let idx = self.thread_for_cursor()?;
+        let used: HashSet<&String> = self.threads[idx].reactions.iter().collect();
         // pick the first reaction not yet present
         let pick = REACTION_CYCLE
             .iter()
             .find(|r| !used.contains(&r.to_string()))
             .copied()
             .unwrap_or(REACTION_CYCLE[0]);
-        self.drafts[idx].reactions.push(pick.to_string());
+        self.threads[idx].reactions.push(pick.to_string());
         Some(pick.to_string())
     }
 
     pub fn clear_reactions_at_cursor(&mut self) -> bool {
-        let Some(idx) = self.draft_for_cursor() else { return false };
-        let had = !self.drafts[idx].reactions.is_empty();
-        self.drafts[idx].reactions.clear();
+        let Some(idx) = self.thread_for_cursor() else {
+            return false;
+        };
+        let had = !self.threads[idx].reactions.is_empty();
+        self.threads[idx].reactions.clear();
         had
     }
 
     pub fn toggle_resolved_at_cursor(&mut self) -> Option<bool> {
-        let idx = self.draft_for_cursor()?;
-        self.drafts[idx].resolved = !self.drafts[idx].resolved;
-        Some(self.drafts[idx].resolved)
+        let idx = self.thread_for_cursor()?;
+        self.threads[idx].resolved = !self.threads[idx].resolved;
+        Some(self.threads[idx].resolved)
     }
 
-    pub fn mark_outdated_drafts(&mut self) {
-        // a draft is outdated if its anchor line no longer exists in the parsed diff
-        for d in self.drafts.iter_mut() {
+    pub fn mark_outdated_threads(&mut self) {
+        // a thread is outdated if its anchor line no longer exists in the parsed diff
+        for d in self.threads.iter_mut() {
             let Some(file) = self.files.iter().find(|f| f.path == d.file_path) else {
                 d.outdated = true;
                 continue;
             };
             let found = file.hunks.iter().any(|h| {
-                h.lines.iter().any(|l| {
-                    l.old_lineno == d.old_lineno && l.new_lineno == d.new_lineno
-                })
+                h.lines
+                    .iter()
+                    .any(|l| l.old_lineno == d.old_lineno && l.new_lineno == d.new_lineno)
             });
             d.outdated = !found;
         }
     }
 
-    pub fn delete_draft_at_cursor(&mut self) -> bool {
-        if let Some(idx) = self.draft_for_cursor() {
-            self.drafts.remove(idx);
+    pub fn delete_thread_at_cursor(&mut self) -> bool {
+        if let Some(idx) = self.thread_for_cursor() {
+            self.threads.remove(idx);
             true
         } else {
             false
@@ -1370,7 +1442,7 @@ fn flatten(
             file_idx: fi,
             hunk_idx: None,
             line_idx: None,
-                        draft_idx: None,
+            thread_idx: None,
         });
         if expanded.get(fi).copied().unwrap_or(true) {
             for (hi, hunk) in file.hunks.iter().enumerate() {
@@ -1379,7 +1451,7 @@ fn flatten(
                     file_idx: fi,
                     hunk_idx: Some(hi),
                     line_idx: None,
-                        draft_idx: None,
+                    thread_idx: None,
                 });
                 for (li, _) in hunk.lines.iter().enumerate() {
                     out.push(FlatLine {
@@ -1387,7 +1459,7 @@ fn flatten(
                         file_idx: fi,
                         hunk_idx: Some(hi),
                         line_idx: Some(li),
-                        draft_idx: None,
+                        thread_idx: None,
                     });
                 }
             }
@@ -1397,14 +1469,14 @@ fn flatten(
             file_idx: fi,
             hunk_idx: None,
             line_idx: None,
-                        draft_idx: None,
+            thread_idx: None,
         });
         out.push(FlatLine {
             kind: FlatKind::Spacer,
             file_idx: fi,
             hunk_idx: None,
             line_idx: None,
-                        draft_idx: None,
+            thread_idx: None,
         });
     }
     out
@@ -1453,16 +1525,13 @@ fn precompute_intraline(files: &[FileDiff]) -> HashMap<LineKey, IntraRange> {
 fn common_affixes(a: &str, b: &str) -> (usize, usize) {
     let ac: Vec<char> = a.chars().collect();
     let bc: Vec<char> = b.chars().collect();
-    let prefix = ac
-        .iter()
-        .zip(bc.iter())
-        .take_while(|(x, y)| x == y)
-        .count();
-    let max_suffix = ac.len().saturating_sub(prefix).min(bc.len().saturating_sub(prefix));
+    let prefix = ac.iter().zip(bc.iter()).take_while(|(x, y)| x == y).count();
+    let max_suffix = ac
+        .len()
+        .saturating_sub(prefix)
+        .min(bc.len().saturating_sub(prefix));
     let mut suffix = 0;
-    while suffix < max_suffix
-        && ac[ac.len() - 1 - suffix] == bc[bc.len() - 1 - suffix]
-    {
+    while suffix < max_suffix && ac[ac.len() - 1 - suffix] == bc[bc.len() - 1 - suffix] {
         suffix += 1;
     }
     (prefix, suffix)
@@ -1489,13 +1558,13 @@ fn fuzzy_match(haystack: &str, needle: &str) -> bool {
 
 /// Drift-resistant re-anchor: when surrounding code has changed and the
 /// stored anchor line no longer sits at the same lineno, search the current
-/// diff for the verbatim `anchor_content` and snap the draft to the closest
-/// match. Backfills `anchor_content` from the current anchor line for drafts
+/// diff for the verbatim `anchor_content` and snap the thread to the closest
+/// match. Backfills `anchor_content` from the current anchor line for threads
 /// loaded from older JSON that don't have it yet. Returns whether anything
 /// changed (so main.rs can re-save the JSON).
-pub fn reanchor_drafts(drafts: &mut [Draft], files: &[FileDiff]) -> bool {
+pub fn reanchor_threads(threads: &mut [Thread], files: &[FileDiff]) -> bool {
     let mut changed = false;
-    for d in drafts.iter_mut() {
+    for d in threads.iter_mut() {
         let Some(file) = files.iter().find(|f| f.path == d.file_path) else {
             continue;
         };
@@ -1504,7 +1573,7 @@ pub fn reanchor_drafts(drafts: &mut [Draft], files: &[FileDiff]) -> bool {
                 .iter()
                 .find(|l| l.old_lineno == d.old_lineno && l.new_lineno == d.new_lineno)
         });
-        // Backfill: a draft saved before the anchor_content field existed
+        // Backfill: a thread saved before the anchor_content field existed
         // adopts the current anchor's content as its cue.
         if d.anchor_content.is_empty() {
             if let Some(l) = anchor_now {
@@ -1514,7 +1583,10 @@ pub fn reanchor_drafts(drafts: &mut [Draft], files: &[FileDiff]) -> bool {
             continue;
         }
         // Same lineno still holds the same text → nothing to do.
-        if anchor_now.map(|l| l.content == d.anchor_content).unwrap_or(false) {
+        if anchor_now
+            .map(|l| l.content == d.anchor_content)
+            .unwrap_or(false)
+        {
             continue;
         }
         // Otherwise scan all hunks for an exact content match; pick the
@@ -1565,8 +1637,8 @@ pub fn file_diff_hash(file: &FileDiff) -> String {
     format!("{:016x}", h.finish())
 }
 
-/// Generates a stable thread identifier for a freshly created draft. Combines
-/// the anchor location with the creation timestamp so re-creating a draft on
+/// Generates a stable thread identifier for a freshly created thread. Combines
+/// the anchor location with the creation timestamp so re-creating a thread on
 /// the same line yields a fresh ID (and therefore a fresh thread).
 pub fn make_thread_id(
     file_path: &str,
@@ -1612,9 +1684,9 @@ pub fn wrap_body(body: &str, max_w: usize) -> Vec<String> {
     out
 }
 
-/// Usable text width inside a rendered draft box for the given diff body
+/// Usable text width inside a rendered thread box for the given diff body
 /// width (subtracts 2 borders and 1 leading-padding column).
-pub fn draft_text_width(body_width: u16) -> usize {
+pub fn thread_text_width(body_width: u16) -> usize {
     (body_width as usize).saturating_sub(3)
 }
 

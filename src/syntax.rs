@@ -28,7 +28,13 @@ impl Highlighter {
                 .themes
                 .get("base16-ocean.dark")
                 .cloned()
-                .unwrap_or_else(|| ts.themes.values().next().cloned().expect("at least one theme"));
+                .unwrap_or_else(|| {
+                    ts.themes
+                        .values()
+                        .next()
+                        .cloned()
+                        .expect("at least one theme")
+                });
             Highlighter { ps, theme }
         })
     }

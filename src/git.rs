@@ -93,8 +93,20 @@ fn resolve_base(root: &Path) -> Result<String> {
 
     // Non-trunk branches: behave like a PR — base is main/master, not @{upstream}.
     // (an @{upstream} like origin/feature would diff the branch against itself)
+    //
+    // Probe order: `upstream/*` first so fork workflows (where `origin` points
+    // at the user's fork and `upstream` at the canonical repo) diff against
+    // the canonical trunk, not the fork's possibly-stale copy. Then `origin/*`
+    // for the common solo workflow, then local `main`/`master` as a last resort.
     if !on_trunk {
-        for candidate in ["origin/main", "origin/master", "main", "master"] {
+        for candidate in [
+            "upstream/main",
+            "upstream/master",
+            "origin/main",
+            "origin/master",
+            "main",
+            "master",
+        ] {
             if Some(candidate) == current.as_deref() {
                 continue;
             }

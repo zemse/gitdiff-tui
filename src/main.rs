@@ -1,4 +1,5 @@
 mod app;
+mod cli;
 mod clipboard;
 mod diff;
 mod git;
@@ -18,14 +19,20 @@ use crossterm::terminal::{
 };
 use ratatui::Terminal;
 use ratatui::backend::CrosstermBackend;
-use std::env;
 use std::io;
 use std::time::Duration;
 use tui_textarea::{CursorMove, TextArea};
 
 fn main() -> Result<()> {
-    let args: Vec<String> = env::args().skip(1).collect();
-    let override_range = args.iter().find(|a| a.contains("..")).cloned();
+    // Parse argv with clap. Subcommands run inside `parse_and_dispatch` and
+    // return `Ok(None)`; the no-subcommand path returns the parsed `Cli` so we
+    // can pick up `cli.range` and launch the TUI below. clap exits the process
+    // itself on --help / --version.
+    let cli = match cli::parse_and_dispatch()? {
+        None => return Ok(()),
+        Some(c) => c,
+    };
+    let override_range = cli.range.clone();
 
     let root = git::repo_root()?;
     let source = git::detect_source(&root, override_range)?;
@@ -34,17 +41,13 @@ fn main() -> Result<()> {
     let raw = git::get_diff(&root, &source, opts)?;
     let files = diff::parse(&raw)?;
 
-    let mut drafts = review::load_drafts(&root, &source)?;
-    // Backfill thread_ids on drafts saved before the threads feature shipped,
+    let mut threads = review::load_threads(&root, &source)?;
+    // Backfill thread_ids on threads saved before the threads feature shipped,
     // so they survive the next round-trip with stable IDs.
-    for d in drafts.iter_mut() {
+    for d in threads.iter_mut() {
         if d.thread_id.is_empty() {
-            d.thread_id = app::make_thread_id(
-                &d.file_path,
-                d.old_lineno,
-                d.new_lineno,
-                &d.created_at,
-            );
+            d.thread_id =
+                app::make_thread_id(&d.file_path, d.old_lineno, d.new_lineno, &d.created_at);
         }
     }
     // Merge any agent replies that have been added to the REVIEW-*.md file
@@ -55,14 +58,12 @@ fn main() -> Result<()> {
     if review_p.exists() {
         if let Ok(text) = std::fs::read_to_string(&review_p) {
             let map = review::parse_review_replies(&text);
-            for d in drafts.iter_mut() {
+            for d in threads.iter_mut() {
                 if let Some(import) = map.get(&d.thread_id) {
                     // Dedupe by (author, created_at, body); append the rest.
                     for r in &import.replies {
                         let dup = d.replies.iter().any(|x| {
-                            x.author == r.author
-                                && x.created_at == r.created_at
-                                && x.body == r.body
+                            x.author == r.author && x.created_at == r.created_at && x.body == r.body
                         });
                         if !dup {
                             d.replies.push(r.clone());
@@ -78,7 +79,7 @@ fn main() -> Result<()> {
         }
     }
     // Cleanup pass for the duplicate-reply drift produced by older builds.
-    // Two passes per draft:
+    // Two passes per thread:
     //   1. Collapse synthetic 'X\nX\n…' bodies. The old parser merged
     //      consecutive '> [@a T] X' lines (same author+ts) into one
     //      multi-line Reply body, and a duplicated line therefore became
@@ -88,7 +89,7 @@ fn main() -> Result<()> {
     //      the first (most-precise) occurrence. This catches the
     //      microsecond-vs-second-precision drift from the old write_review.
     let mut deduped_any = false;
-    for d in drafts.iter_mut() {
+    for d in threads.iter_mut() {
         let before = d.replies.len();
         for r in d.replies.iter_mut() {
             let lines: Vec<&str> = r.body.split('\n').collect();
@@ -105,13 +106,13 @@ fn main() -> Result<()> {
         }
     }
     if merged_any || deduped_any {
-        let _ = review::save_drafts(&root, &source, &drafts);
+        let _ = review::save_threads(&root, &source, &threads);
     }
-    // Drift-resistant re-anchor: snap drafts to the current line numbers
+    // Drift-resistant re-anchor: snap threads to the current line numbers
     // when the surrounding code has moved. Also backfills `anchor_content`
-    // for drafts saved before that field existed.
-    if app::reanchor_drafts(&mut drafts, &files) {
-        let _ = review::save_drafts(&root, &source, &drafts);
+    // for threads saved before that field existed.
+    if app::reanchor_threads(&mut threads, &files) {
+        let _ = review::save_threads(&root, &source, &threads);
     }
     let mut viewed = review::load_viewed(&root, &source).unwrap_or_default();
     // Drop viewed marks whose stored hash no longer matches the file's current
@@ -124,9 +125,9 @@ fn main() -> Result<()> {
             .collect();
         viewed.retain(|path, stored_hash| current.get(path) == Some(stored_hash));
     }
-    let mut state = AppState::new(source.clone(), source_label, files, drafts, viewed);
+    let mut state = AppState::new(source.clone(), source_label, files, threads, viewed);
     state.opts = opts;
-    state.mark_outdated_drafts();
+    state.mark_outdated_threads();
     prefetch_file_blobs(&mut state, &root);
 
     let (base_sha, head_sha) = match &source {
@@ -163,7 +164,7 @@ fn main() -> Result<()> {
     )?;
     terminal.show_cursor()?;
 
-    let _ = review::save_drafts(&root, &state.source, &state.drafts);
+    let _ = review::save_threads(&root, &state.source, &state.threads);
     let _ = review::save_viewed(&root, &state.source, &state.viewed);
 
     result
@@ -201,6 +202,12 @@ fn run_loop<B: ratatui::backend::Backend>(
                 state.should_quit = true;
                 return Ok(());
             }
+        }
+        // Track the mouse cursor so the renderer can pop a tooltip when it's
+        // over a registered hover region (e.g. a comment's "5m ago" label).
+        // Update regardless of mode; the renderer decides when to act on it.
+        if let Event::Mouse(m) = &ev {
+            state.hover_pos = Some((m.column, m.row));
         }
         match state.mode {
             Mode::Normal => {
@@ -303,10 +310,15 @@ fn handle_normal(
         KeyCode::Char('}') => state.jump_next_hunk(),
         KeyCode::Char('{') => state.jump_prev_hunk(),
         KeyCode::Char('n') => {
-            if state.jump_next_thread_needing_attention() {
-                state.status = Some("→ next thread awaiting your reply".into());
+            let before = state.cursor;
+            if !state.jump_next_thread_needing_attention() {
+                state.status = Some("no unread comments".into());
+            } else if state.cursor == before {
+                // Wrap landed back on the same anchor → there's only one
+                // unread thread and we're already standing on it.
+                state.status = Some("only unread comment — you're on it".into());
             } else {
-                state.status = Some("no threads awaiting your reply".into());
+                state.status = Some("→ next unread comment".into());
             }
         }
         KeyCode::Char('?') => state.mode = Mode::Help,
@@ -327,8 +339,10 @@ fn handle_normal(
             state.show_tree = !state.show_tree;
         }
         KeyCode::Char('R') => {
-            state.show_drafts_pane = !state.show_drafts_pane;
-            state.drafts_cursor = state.drafts_cursor.min(state.drafts.len().saturating_sub(1).max(0));
+            state.show_threads_pane = !state.show_threads_pane;
+            state.threads_cursor = state
+                .threads_cursor
+                .min(state.threads.len().saturating_sub(1).max(0));
         }
         KeyCode::Char('t') => {
             state.picker = Some(FuzzyPicker {
@@ -438,8 +452,8 @@ fn handle_normal(
             }
         }
         KeyCode::Char('x') => {
-            if state.delete_draft_at_cursor() {
-                state.status = Some("draft deleted".into());
+            if state.delete_thread_at_cursor() {
+                state.status = Some("thread deleted".into());
             }
         }
         KeyCode::Char('S') => {
@@ -449,22 +463,22 @@ fn handle_normal(
                 &state.source_label,
                 base_sha,
                 head_sha,
-                &state.drafts,
+                &state.threads,
                 state.verdict,
             )?;
-            review::save_drafts(root, &state.source, &state.drafts)?;
+            review::save_threads(root, &state.source, &state.threads)?;
             stamp_review_mtime(state, root);
             state.status = Some(format!("wrote {} ({})", p.display(), state.verdict.label()));
         }
         KeyCode::Char('r') => {
             if let Some(now_resolved) = state.toggle_resolved_at_cursor() {
                 state.status = Some(if now_resolved {
-                    "draft resolved".into()
+                    "thread resolved".into()
                 } else {
-                    "draft re-opened".into()
+                    "thread re-opened".into()
                 });
             } else {
-                state.status = Some("no draft at cursor".into());
+                state.status = Some("no thread at cursor".into());
             }
         }
         KeyCode::Char('V') => {
@@ -475,7 +489,7 @@ fn handle_normal(
             if let Some(r) = state.add_reaction_at_cursor() {
                 state.status = Some(format!("reacted: {r}"));
             } else {
-                state.status = Some("no draft at cursor".into());
+                state.status = Some("no thread at cursor".into());
             }
         }
         KeyCode::Char('0') => {
@@ -507,10 +521,12 @@ fn poll_review_file(state: &mut AppState, root: &std::path::Path) -> bool {
     if prev.is_none() {
         return false;
     }
-    let Ok(text) = std::fs::read_to_string(&p) else { return false };
+    let Ok(text) = std::fs::read_to_string(&p) else {
+        return false;
+    };
     let map = review::parse_review_replies(&text);
     let mut changed = false;
-    for d in state.drafts.iter_mut() {
+    for d in state.threads.iter_mut() {
         if let Some(import) = map.get(&d.thread_id) {
             for r in &import.replies {
                 let dup = d.replies.iter().any(|x| {
@@ -528,7 +544,7 @@ fn poll_review_file(state: &mut AppState, root: &std::path::Path) -> bool {
         }
     }
     if changed {
-        let _ = review::save_drafts(root, &state.source, &state.drafts);
+        let _ = review::save_threads(root, &state.source, &state.threads);
         state.rebuild_flat();
         state.status = Some("imported replies from REVIEW.md".into());
     }
@@ -563,7 +579,9 @@ fn handle_composer_mouse(
         }
         _ => {}
     }
-    let Some((px, py, pw, ph)) = state.composer_rect else { return };
+    let Some((px, py, pw, ph)) = state.composer_rect else {
+        return;
+    };
     // Inner text area sits inside the 1-row border plus 1-col horizontal padding
     // configured in ui::draw_composer.
     if pw < 4 || ph < 3 {
@@ -623,7 +641,11 @@ fn ta_selection_start(ta: &TextArea<'_>) -> Option<(usize, usize)> {
     let ((sr, sc), (er, ec)) = ta.selection_range()?;
     // selection_range returns the lower position first. The anchor is whichever
     // endpoint isn't the current cursor.
-    if (sr, sc) == (cr, cc) { Some((er, ec)) } else { Some((sr, sc)) }
+    if (sr, sc) == (cr, cc) {
+        Some((er, ec))
+    } else {
+        Some((sr, sc))
+    }
 }
 
 fn handle_mouse(
@@ -632,13 +654,13 @@ fn handle_mouse(
     composer: &mut Option<TextArea<'static>>,
     root: &std::path::Path,
 ) {
-    // If the click is in the left sidebar (tree) or right (drafts), dispatch there.
+    // If the click is in the left sidebar (tree) or right (threads), dispatch there.
     if state.show_tree && m.column < state.body_x {
         handle_tree_mouse(state, m);
         return;
     }
-    if state.show_drafts_pane && m.column >= state.body_x + state.body_width {
-        handle_drafts_mouse(state, m);
+    if state.show_threads_pane && m.column >= state.body_x + state.body_width {
+        handle_threads_mouse(state, m);
         return;
     }
     // Selection-menu hit-test runs before anything else so the buttons stay
@@ -722,11 +744,11 @@ fn handle_mouse(
                         state.toggle_hunk_collapse(fl.file_idx, hi);
                     }
                 }
-                FlatKind::DraftRow => {
+                FlatKind::ThreadRow => {
                     state.cursor = idx;
                     state.clear_selection();
-                    if let Some(di) = fl.draft_idx {
-                        edit_draft(state, di, composer);
+                    if let Some(ti) = fl.thread_idx {
+                        edit_thread(state, ti, composer);
                     }
                 }
                 FlatKind::ExpandBtnAbove | FlatKind::ExpandBtnBelow => {
@@ -813,7 +835,7 @@ fn handle_tree_mouse(state: &mut AppState, m: MouseEvent) {
     state.jump_to_file(row);
 }
 
-fn handle_drafts_mouse(state: &mut AppState, m: MouseEvent) {
+fn handle_threads_mouse(state: &mut AppState, m: MouseEvent) {
     if !matches!(m.kind, MouseEventKind::Down(MouseButton::Left)) {
         return;
     }
@@ -821,14 +843,14 @@ fn handle_drafts_mouse(state: &mut AppState, m: MouseEvent) {
     if m.row < content_top {
         return;
     }
-    // Each draft entry spans 3 rows in our renderer (header, preview, blank).
+    // Each thread entry spans 3 rows in our renderer (header, preview, blank).
     let row = (m.row - content_top) as usize;
     let idx = row / 3;
-    if idx >= state.drafts.len() {
+    if idx >= state.threads.len() {
         return;
     }
-    state.drafts_cursor = idx;
-    state.jump_to_draft(idx);
+    state.threads_cursor = idx;
+    state.jump_to_thread(idx);
 }
 
 fn handle_picker(state: &mut AppState, ev: &Event) {
@@ -878,16 +900,20 @@ fn handle_picker(state: &mut AppState, ev: &Event) {
     }
     // clamp cursor to matches len after update
     if let Some(picker) = state.picker.as_mut() {
-        let len = state.files.iter().filter(|f| {
-            if picker.query.is_empty() {
-                true
-            } else {
-                let q = picker.query.to_lowercase();
-                let h = f.path.to_lowercase();
-                let mut it = h.chars();
-                q.chars().all(|c| it.any(|x| x == c))
-            }
-        }).count();
+        let len = state
+            .files
+            .iter()
+            .filter(|f| {
+                if picker.query.is_empty() {
+                    true
+                } else {
+                    let q = picker.query.to_lowercase();
+                    let h = f.path.to_lowercase();
+                    let mut it = h.chars();
+                    q.chars().all(|c| it.any(|x| x == c))
+                }
+            })
+            .count();
         if len == 0 {
             picker.cursor = 0;
         } else {
@@ -896,12 +922,12 @@ fn handle_picker(state: &mut AppState, ev: &Event) {
     }
 }
 
-fn edit_draft(
+fn edit_thread(
     state: &mut AppState,
-    draft_idx: usize,
+    thread_idx: usize,
     composer: &mut Option<TextArea<'static>>,
 ) -> bool {
-    let d = match state.drafts.get(draft_idx) {
+    let d = match state.threads.get(thread_idx) {
         Some(d) => d.clone(),
         None => return false,
     };
@@ -919,7 +945,9 @@ fn edit_draft(
         };
         line.old_lineno == d.old_lineno && line.new_lineno == d.new_lineno
     });
-    let Some(anchor_idx) = target else { return false };
+    let Some(anchor_idx) = target else {
+        return false;
+    };
     state.start_selection(anchor_idx);
     state.finish_selection();
     open_composer(state, composer);
@@ -945,9 +973,9 @@ fn open_composer(state: &mut AppState, composer: &mut Option<TextArea<'static>>)
     *composer = Some(ta);
     state.mode = Mode::Composing;
     state.composer_target = Some(target);
-    state.editing_draft_idx = target.hides_draft();
-    if state.editing_draft_idx.is_some() {
-        // Hide the draft being edited/replied to so the composer takes its slot.
+    state.editing_thread_idx = target.hides_thread();
+    if state.editing_thread_idx.is_some() {
+        // Hide the thread being edited/replied to so the composer takes its slot.
         state.rebuild_flat();
     }
     // Seed composer_height with the body's natural size so the gap computed on
@@ -956,31 +984,36 @@ fn open_composer(state: &mut AppState, composer: &mut Option<TextArea<'static>>)
         .saturating_add(2)
         .max(ui::COMPOSER_MIN_H);
     state.composer_height = h;
-    // Scroll so the composer-gap fits in view. For new/edit-draft the gap is
+    // Scroll so the composer-gap fits in view. For new/edit-thread the gap is
     // anchored at the selection end; for reply targets it sits below the
-    // draft's last row.
+    // thread's last row.
     let composer_h = state.composer_height as usize;
     let gap_pos: usize = match target {
-        ComposerTarget::NewReply(idx) | ComposerTarget::EditReply { draft_idx: idx, .. } => state
+        ComposerTarget::NewReply(idx)
+        | ComposerTarget::EditReply {
+            thread_idx: idx, ..
+        } => state
             .flat
             .iter()
             .enumerate()
             .rev()
             .find_map(|(i, fl)| {
-                (fl.kind == FlatKind::DraftRow && fl.draft_idx == Some(idx)).then_some(i + 1)
+                (fl.kind == FlatKind::ThreadRow && fl.thread_idx == Some(idx)).then_some(i + 1)
             })
-            .unwrap_or_else(|| state.selection.map(|s| s.range().1 + 1).unwrap_or(state.cursor)),
+            .unwrap_or_else(|| {
+                state
+                    .selection
+                    .map(|s| s.range().1 + 1)
+                    .unwrap_or(state.cursor)
+            }),
         _ => state
             .selection
             .map(|s| s.range().1 + 1)
             .unwrap_or(state.cursor),
     };
     let needed_scroll_floor = (gap_pos + composer_h).saturating_sub(state.viewport_height);
-    // Keep the selection (or the head of the draft) visible at the top if possible.
-    let keep_top = state
-        .selection
-        .map(|s| s.range().0)
-        .unwrap_or(state.cursor);
+    // Keep the selection (or the head of the thread) visible at the top if possible.
+    let keep_top = state.selection.map(|s| s.range().0).unwrap_or(state.cursor);
     let scroll_target = needed_scroll_floor.min(keep_top);
     if state.scroll < scroll_target {
         state.scroll = scroll_target;
@@ -991,11 +1024,11 @@ fn close_composer(state: &mut AppState, composer: &mut Option<TextArea<'static>>
     *composer = None;
     state.mode = Mode::Normal;
     state.composer_height = 0;
-    state.editing_draft_idx = None;
+    state.editing_thread_idx = None;
     state.composer_target = None;
     state.clear_selection();
     state.cursor_visible = false;
-    // Always rebuild so a newly-saved (or just-edited) draft renders on the
+    // Always rebuild so a newly-saved (or just-edited) thread renders on the
     // next frame without waiting for an unrelated trigger.
     state.rebuild_flat();
 }
@@ -1034,15 +1067,13 @@ fn handle_composing(
                 .unwrap_or_default()
                 .trim()
                 .to_string();
-            let target = state
-                .composer_target
-                .unwrap_or(ComposerTarget::NewDraft);
+            let target = state.composer_target.unwrap_or(ComposerTarget::NewThread);
             if body.is_empty() {
                 state.status = Some("empty comment, cancelled".into());
             } else if state.save_composer(target, body) {
                 // Persist to the JSON store on every save so a crash before
                 // submit doesn't lose work.
-                let _ = review::save_drafts(root, &state.source, &state.drafts);
+                let _ = review::save_threads(root, &state.source, &state.threads);
                 let is_reply = matches!(
                     target,
                     ComposerTarget::NewReply(_) | ComposerTarget::EditReply { .. }
@@ -1057,7 +1088,7 @@ fn handle_composing(
                         &state.source_label,
                         base_sha,
                         head_sha,
-                        &state.drafts,
+                        &state.threads,
                         state.verdict,
                     ) {
                         suffix = format!("REVIEW.md updated → {}", p.display());
@@ -1065,8 +1096,8 @@ fn handle_composing(
                     }
                 }
                 let msg = match target {
-                    ComposerTarget::NewDraft => "draft saved",
-                    ComposerTarget::EditDraft(_) => "comment edited",
+                    ComposerTarget::NewThread => "thread saved",
+                    ComposerTarget::EditThread(_) => "comment edited",
                     ComposerTarget::EditReply { .. } => "reply edited",
                     ComposerTarget::NewReply(_) => "reply added",
                 };
@@ -1075,14 +1106,14 @@ fn handle_composing(
             close_composer(state, composer);
         }
         KeyCode::Char('d') if ctrl => {
-            // ctrl-d only deletes when editing the original draft. Reply
+            // ctrl-d only deletes when editing the original thread. Reply
             // edits/new-reply paths leave it as a no-op to avoid accidentally
             // nuking a thread someone replied to.
             match state.composer_target {
-                Some(ComposerTarget::EditDraft(idx)) => {
-                    state.drafts.remove(idx);
+                Some(ComposerTarget::EditThread(idx)) => {
+                    state.threads.remove(idx);
                     close_composer(state, composer);
-                    state.status = Some("draft deleted".into());
+                    state.status = Some("thread deleted".into());
                 }
                 Some(ComposerTarget::EditReply { .. } | ComposerTarget::NewReply(_)) => {
                     state.status = Some("ctrl-d disabled inside a thread".into());

@@ -1,4 +1,4 @@
-use crate::app::{Draft, Reply, Verdict};
+use crate::app::{Reply, Thread, Verdict};
 use crate::git::DiffSource;
 use anyhow::{Context, Result};
 use chrono::{DateTime, Utc};
@@ -6,9 +6,9 @@ use std::collections::{BTreeMap, HashMap};
 use std::fs;
 use std::path::{Path, PathBuf};
 
-pub fn drafts_path(root: &Path, source: &DiffSource) -> PathBuf {
+pub fn threads_path(root: &Path, source: &DiffSource) -> PathBuf {
     root.join(".gitdiff")
-        .join(format!("drafts-{}.json", source.slug()))
+        .join(format!("threads-{}.json", source.slug()))
 }
 
 pub fn viewed_path(root: &Path, source: &DiffSource) -> PathBuf {
@@ -60,8 +60,23 @@ pub fn save_viewed(
     Ok(())
 }
 
-pub fn load_drafts(root: &Path, source: &DiffSource) -> Result<Vec<Draft>> {
-    let p = drafts_path(root, source);
+pub fn load_threads(root: &Path, source: &DiffSource) -> Result<Vec<Thread>> {
+    let p = threads_path(root, source);
+    // One-time migration from the old `drafts-{slug}.json` name. Rename the
+    // file in place so subsequent runs read the canonical path. If the rename
+    // fails (e.g. permissions), fall through and return empty — the user can
+    // rename manually.
+    if !p.exists() {
+        let legacy = root
+            .join(".gitdiff")
+            .join(format!("drafts-{}.json", source.slug()));
+        if legacy.exists() {
+            if let Some(dir) = p.parent() {
+                let _ = fs::create_dir_all(dir);
+            }
+            let _ = fs::rename(&legacy, &p);
+        }
+    }
     if !p.exists() {
         return Ok(Vec::new());
     }
@@ -72,12 +87,12 @@ pub fn load_drafts(root: &Path, source: &DiffSource) -> Result<Vec<Draft>> {
     Ok(serde_json::from_str(&raw).with_context(|| format!("parse {}", p.display()))?)
 }
 
-pub fn save_drafts(root: &Path, source: &DiffSource, drafts: &[Draft]) -> Result<()> {
-    let p = drafts_path(root, source);
+pub fn save_threads(root: &Path, source: &DiffSource, threads: &[Thread]) -> Result<()> {
+    let p = threads_path(root, source);
     if let Some(dir) = p.parent() {
         fs::create_dir_all(dir)?;
     }
-    let raw = serde_json::to_string_pretty(drafts)?;
+    let raw = serde_json::to_string_pretty(threads)?;
     fs::write(&p, raw).with_context(|| format!("write {}", p.display()))?;
     Ok(())
 }
@@ -116,7 +131,7 @@ pub fn write_review(
     source_label: &str,
     base_sha: Option<&str>,
     head_sha: Option<&str>,
-    drafts: &[Draft],
+    threads: &[Thread],
     verdict: Verdict,
 ) -> Result<PathBuf> {
     let p = review_path(root, source);
@@ -133,31 +148,31 @@ pub fn write_review(
     }
     out.push_str(&format!("Verdict: {}\n", verdict.label()));
     let _ = source;
-    let open = drafts.iter().filter(|d| !d.resolved).count();
-    let resolved = drafts.len() - open;
-    let outdated = drafts.iter().filter(|d| d.outdated).count();
+    let open = threads.iter().filter(|d| !d.resolved).count();
+    let resolved = threads.len() - open;
+    let outdated = threads.iter().filter(|d| d.outdated).count();
     out.push_str(&format!(
         "Status: {open} open · {resolved} resolved · {outdated} outdated\n\n---\n\n"
     ));
 
-    if drafts.is_empty() {
+    if threads.is_empty() {
         out.push_str("_No comments yet._\n");
         fs::write(&p, out)?;
         return Ok(p);
     }
 
-    write_section(&mut out, "Open", drafts.iter().filter(|d| !d.resolved));
+    write_section(&mut out, "Open", threads.iter().filter(|d| !d.resolved));
     if resolved > 0 {
         out.push_str("---\n\n# Resolved\n\n");
-        write_section(&mut out, "Resolved", drafts.iter().filter(|d| d.resolved));
+        write_section(&mut out, "Resolved", threads.iter().filter(|d| d.resolved));
     }
 
     fs::write(&p, out).with_context(|| format!("write {}", p.display()))?;
     Ok(p)
 }
 
-fn write_section<'a>(out: &mut String, _label: &str, ds: impl Iterator<Item = &'a Draft>) {
-    let mut by_file: BTreeMap<String, Vec<&Draft>> = BTreeMap::new();
+fn write_section<'a>(out: &mut String, _label: &str, ds: impl Iterator<Item = &'a Thread>) {
+    let mut by_file: BTreeMap<String, Vec<&Thread>> = BTreeMap::new();
     for d in ds {
         by_file.entry(d.file_path.clone()).or_default().push(d);
     }
@@ -236,14 +251,16 @@ pub struct ThreadImport {
 
 /// Scans a REVIEW-*.md file and extracts all `<!-- replies:tID --> ... <!-- /replies:tID -->`
 /// blocks. Returns a thread_id → import map for merging back into the JSON
-/// draft store on launch.
+/// thread store on launch.
 pub fn parse_review_replies(text: &str) -> HashMap<String, ThreadImport> {
     let mut out: HashMap<String, ThreadImport> = HashMap::new();
     let mut cursor = 0;
     while let Some(start) = text[cursor..].find("<!-- replies:") {
         let abs_start = cursor + start;
         let head = &text[abs_start..];
-        let Some(close_idx) = head.find(" -->") else { break };
+        let Some(close_idx) = head.find(" -->") else {
+            break;
+        };
         let tid = head["<!-- replies:".len()..close_idx].trim().to_string();
         let body_start = abs_start + close_idx + " -->".len();
         let end_marker = format!("<!-- /replies:{tid} -->");
@@ -277,7 +294,9 @@ pub fn parse_review_replies(text: &str) -> HashMap<String, ThreadImport> {
             }
             // Parse: > [@handle 2026-05-24T17:05:00Z] body...
             let rest = &line[3..]; // drop "> ["
-            let Some(close_br) = rest.find(']') else { continue };
+            let Some(close_br) = rest.find(']') else {
+                continue;
+            };
             let header = &rest[1..close_br]; // skip leading '@'
             let body_part = rest[close_br + 1..].trim_start();
             let mut it = header.splitn(2, ' ');
@@ -315,5 +334,7 @@ pub fn parse_review_replies(text: &str) -> HashMap<String, ThreadImport> {
 }
 
 fn parse_ts(s: &str) -> Option<DateTime<Utc>> {
-    DateTime::parse_from_rfc3339(s).ok().map(|d| d.with_timezone(&Utc))
+    DateTime::parse_from_rfc3339(s)
+        .ok()
+        .map(|d| d.with_timezone(&Utc))
 }
