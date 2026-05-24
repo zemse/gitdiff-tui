@@ -74,15 +74,29 @@ pub fn draw(f: &mut Frame, state: &mut AppState, composer: Option<&mut TextArea<
     draw_body(f, body_area, state);
     draw_footer(f, vert[2], state);
 
+    // Stale by default; the composer/menu draw paths below populate when shown.
+    state.composer_rect = None;
+    state.selection_menu_rect = None;
+
     if state.mode == Mode::Composing {
         if let Some(ta) = composer {
             let popup = composer_rect(body_area, state);
+            state.composer_rect = Some((popup.x, popup.y, popup.width, popup.height));
             draw_composer(f, popup, state, ta);
         }
     } else if state.mode == Mode::Help {
         draw_help(f, area);
     } else if state.mode == Mode::Picker {
         draw_picker(f, area, state);
+    } else if state.mode == Mode::Normal {
+        // Floating [copy] [comment] menu for a finished drag selection.
+        if let Some(sel) = state.selection {
+            if !sel.dragging && sel.start != sel.end && !state.selection_lines().is_empty() {
+                if let Some(rect) = draw_selection_menu(f, body_area, state) {
+                    state.selection_menu_rect = Some((rect.x, rect.y, rect.width, rect.height));
+                }
+            }
+        }
     }
 }
 
@@ -353,7 +367,14 @@ fn draw_topbar(f: &mut Frame, area: Rect, state: &AppState) {
 }
 
 fn draw_footer(f: &mut Frame, area: Rect, state: &AppState) {
+    let has_finished_selection = matches!(
+        state.selection,
+        Some(s) if !s.dragging && s.start != s.end
+    );
     let hint = match state.mode {
+        Mode::Normal if has_finished_selection => {
+            "selection · c comment · y copy · esc clear · click elsewhere clears"
+        }
         Mode::Normal => {
             "j/k · ]/[ file · }/{ hunk · e tree · t pick · R drafts · v viewed · y yank · c comment · S submit · ? help · q quit"
         }
@@ -470,6 +491,94 @@ fn draw_body(f: &mut Frame, area: Rect, state: &AppState) {
         total_rows,
         content_area.height as usize,
     );
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SelectionMenuAction {
+    Copy,
+    Comment,
+    Cancel,
+}
+
+const SELECTION_MENU_BUTTONS: &[(&str, SelectionMenuAction)] = &[
+    ("copy", SelectionMenuAction::Copy),
+    ("comment", SelectionMenuAction::Comment),
+    ("cancel", SelectionMenuAction::Cancel),
+];
+
+const SELECTION_MENU_GAP: u16 = 2;
+
+/// Returns `(total_width, [(x_offset_from_start, width, action), ...])` for
+/// the floating copy/comment/cancel buttons. Each button reads `[ word ]`.
+fn selection_menu_layout() -> (u16, Vec<(u16, u16, SelectionMenuAction)>) {
+    let mut x: u16 = 0;
+    let mut out = Vec::new();
+    for (i, (word, action)) in SELECTION_MENU_BUTTONS.iter().enumerate() {
+        if i > 0 {
+            x += SELECTION_MENU_GAP;
+        }
+        let w = (word.len() + 4) as u16;
+        out.push((x, w, *action));
+        x += w;
+    }
+    (x, out)
+}
+
+/// Maps a screen click to a button on the floating selection menu, if any.
+pub fn selection_menu_hit(state: &AppState, col: u16, row: u16) -> Option<SelectionMenuAction> {
+    let (mx, my, _mw, _mh) = state.selection_menu_rect?;
+    if row != my {
+        return None;
+    }
+    let (_, buttons) = selection_menu_layout();
+    for (off, w, action) in buttons {
+        let bx = mx + off;
+        if col >= bx && col < bx + w {
+            return Some(action);
+        }
+    }
+    None
+}
+
+fn draw_selection_menu(f: &mut Frame, body: Rect, state: &AppState) -> Option<Rect> {
+    let sel = state.selection?;
+    let (_, end) = sel.range();
+    let (total_width, buttons) = selection_menu_layout();
+    if total_width + 1 >= body.width {
+        return None;
+    }
+    let x = body.x + body.width.saturating_sub(total_width + 1);
+    // Prefer one row below the selection end; clamp to body bottom.
+    let row_below = if end >= state.scroll {
+        body.y.saturating_add((end - state.scroll) as u16).saturating_add(1)
+    } else {
+        body.y
+    };
+    let max_y = body.y + body.height.saturating_sub(1);
+    let y = row_below.min(max_y);
+    let rect = Rect { x, y, width: total_width, height: 1 };
+
+    f.render_widget(Clear, rect);
+    let bg = Color::Rgb(40, 50, 70);
+    let border_style = Style::default().fg(Color::Yellow).bg(bg);
+    let text_style = Style::default()
+        .fg(Color::Rgb(220, 230, 245))
+        .bg(bg)
+        .add_modifier(Modifier::BOLD);
+    let gap_style = Style::default().bg(Color::Reset);
+
+    let mut spans: Vec<Span<'static>> = Vec::new();
+    for (i, ((word, _), _)) in SELECTION_MENU_BUTTONS.iter().zip(buttons.iter()).enumerate() {
+        if i > 0 {
+            spans.push(Span::styled(" ".repeat(SELECTION_MENU_GAP as usize), gap_style));
+        }
+        spans.push(Span::styled("[ ", border_style));
+        spans.push(Span::styled((*word).to_string(), text_style));
+        spans.push(Span::styled(" ]", border_style));
+    }
+    let para = Paragraph::new(Line::from(spans));
+    f.render_widget(para, rect);
+    Some(rect)
 }
 
 /// Returns (extended_position, height) of the composer-induced gap.

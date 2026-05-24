@@ -178,6 +178,12 @@ pub struct AppState {
     // rebuild_flat hides that draft's rows so the composer replaces (not
     // duplicates) the rendered comment.
     pub editing_draft_idx: Option<usize>,
+    // Geometry of the composer popup as drawn last frame (x, y, w, h). Used to
+    // map mouse coordinates into the embedded TextArea for drag-select.
+    pub composer_rect: Option<(u16, u16, u16, u16)>,
+    // Geometry of the floating copy/comment menu shown after a drag selection.
+    // Used for hit-testing clicks on its buttons.
+    pub selection_menu_rect: Option<(u16, u16, u16, u16)>,
 }
 
 #[derive(Debug, Clone)]
@@ -236,6 +242,8 @@ impl AppState {
             body_width: 80,
             composer_height: 0,
             editing_draft_idx: None,
+            composer_rect: None,
+            selection_menu_rect: None,
         };
         // start on first code line if possible
         if let Some(i) = s.flat.iter().position(|l| l.kind == FlatKind::Code) {
@@ -905,6 +913,25 @@ impl AppState {
                 Some((fl.file_idx, fl.hunk_idx?, fl.line_idx?))
             })
             .collect()
+    }
+
+    /// Plain code content of the currently selected lines (no gutter or sign
+    /// prefix), joined with newlines. Returns None if nothing is selected.
+    pub fn selection_text(&self) -> Option<String> {
+        let keys = self.selection_lines();
+        if keys.is_empty() {
+            return None;
+        }
+        let mut out = String::new();
+        for (fi, hi, li) in keys {
+            if let Some(l) = self.files.get(fi).and_then(|f| f.hunks.get(hi)).and_then(|h| h.lines.get(li)) {
+                if !out.is_empty() {
+                    out.push('\n');
+                }
+                out.push_str(&l.content);
+            }
+        }
+        Some(out)
     }
 
     pub fn existing_draft_body_for_selection(&self) -> Option<String> {

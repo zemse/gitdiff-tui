@@ -21,7 +21,7 @@ use ratatui::backend::CrosstermBackend;
 use std::env;
 use std::io;
 use std::time::Duration;
-use tui_textarea::TextArea;
+use tui_textarea::{CursorMove, TextArea};
 
 fn main() -> Result<()> {
     let args: Vec<String> = env::args().skip(1).collect();
@@ -120,14 +120,7 @@ fn run_loop<B: ratatui::backend::Backend>(
             }
             Mode::Composing => {
                 if let Event::Mouse(m) = ev {
-                    // let scroll-wheel still pan the diff under the composer;
-                    // click/drag should not interact with the diff while
-                    // composing, so we drop them.
-                    match m.kind {
-                        MouseEventKind::ScrollDown => state.scroll_by(3),
-                        MouseEventKind::ScrollUp => state.scroll_by(-3),
-                        _ => {}
-                    }
+                    handle_composer_mouse(state, m, &mut composer);
                 } else {
                     handle_composing(state, &ev, &mut composer);
                 }
@@ -302,7 +295,16 @@ fn handle_normal(
             state.status = Some(format!("tab width: {}", state.tab_width));
         }
         KeyCode::Char('y') => {
-            if let Some(fl) = state.flat.get(state.cursor) {
+            // With an active selection, copy the selected lines' text; falls
+            // back to the file path so the no-selection muscle memory still works.
+            if let Some(text) = state.selection_text() {
+                let n = state.selection_lines().len();
+                match clipboard::copy(&text) {
+                    Ok(_) => state.status = Some(format!("copied {n} line(s)")),
+                    Err(e) => state.status = Some(format!("clipboard error: {e}")),
+                }
+                state.clear_selection();
+            } else if let Some(fl) = state.flat.get(state.cursor) {
                 if let Some(file) = state.files.get(fl.file_idx) {
                     match clipboard::copy(&file.path) {
                         Ok(_) => state.status = Some(format!("copied: {}", file.path)),
@@ -324,7 +326,11 @@ fn handle_normal(
             }
         }
         KeyCode::Char('c') => {
-            if state.current_line().is_some() {
+            // Use the live selection if any (so a drag → `c` reuses the range);
+            // otherwise fall back to a single-line comment on the cursor.
+            if state.selection.is_some() && !state.selection_lines().is_empty() {
+                open_composer(state, composer);
+            } else if state.current_line().is_some() {
                 state.start_selection(state.cursor);
                 state.finish_selection();
                 open_composer(state, composer);
@@ -382,6 +388,83 @@ fn handle_normal(
     Ok(())
 }
 
+fn handle_composer_mouse(
+    state: &mut AppState,
+    m: MouseEvent,
+    composer: &mut Option<TextArea<'static>>,
+) {
+    // Scroll wheel still pans the diff under the composer so context stays
+    // reachable while typing.
+    match m.kind {
+        MouseEventKind::ScrollDown => {
+            state.scroll_by(3);
+            return;
+        }
+        MouseEventKind::ScrollUp => {
+            state.scroll_by(-3);
+            return;
+        }
+        _ => {}
+    }
+    let Some((px, py, pw, ph)) = state.composer_rect else { return };
+    // Inner text area sits inside the 1-row border plus 1-col horizontal padding
+    // configured in ui::draw_composer.
+    if pw < 4 || ph < 3 {
+        return;
+    }
+    let inner_x = px + 2;
+    let inner_y = py + 1;
+    let inner_w = pw - 4;
+    let inner_h = ph - 2;
+    let inside = m.column >= inner_x
+        && m.column < inner_x + inner_w
+        && m.row >= inner_y
+        && m.row < inner_y + inner_h;
+    if !inside {
+        return;
+    }
+    let Some(ta) = composer.as_mut() else { return };
+    let local_col = (m.column - inner_x) as u16;
+    let local_row = (m.row - inner_y) as u16;
+    match m.kind {
+        MouseEventKind::Down(MouseButton::Left) => {
+            ta.cancel_selection();
+            ta.move_cursor(CursorMove::Jump(local_row, local_col));
+            ta.start_selection();
+        }
+        MouseEventKind::Drag(MouseButton::Left) => {
+            // Selection is anchored at the Down position; moving the cursor
+            // while `is_selecting()` extends it (move_cursor passes shift=true).
+            ta.move_cursor(CursorMove::Jump(local_row, local_col));
+        }
+        MouseEventKind::Up(MouseButton::Left) => {
+            // If the drag never moved, drop the empty selection so the cursor
+            // doesn't appear "stuck" in selection mode.
+            if let Some((sr, sc)) = ta_selection_start(ta) {
+                let (cr, cc) = ta.cursor();
+                if sr == cr && sc == cc {
+                    ta.cancel_selection();
+                }
+            }
+        }
+        _ => {}
+    }
+}
+
+/// tui-textarea 0.7 doesn't expose `selection_start` directly; reconstruct it
+/// by reading the field through the `selection_range` helper if the cursor is
+/// not at the anchor. Returns None when no selection is active.
+fn ta_selection_start(ta: &TextArea<'_>) -> Option<(usize, usize)> {
+    if !ta.is_selecting() {
+        return None;
+    }
+    let (cr, cc) = ta.cursor();
+    let ((sr, sc), (er, ec)) = ta.selection_range()?;
+    // selection_range returns the lower position first. The anchor is whichever
+    // endpoint isn't the current cursor.
+    if (sr, sc) == (cr, cc) { Some((er, ec)) } else { Some((sr, sc)) }
+}
+
 fn handle_mouse(
     state: &mut AppState,
     m: MouseEvent,
@@ -396,6 +479,36 @@ fn handle_mouse(
     if state.show_drafts_pane && m.column >= state.body_x + state.body_width {
         handle_drafts_mouse(state, m);
         return;
+    }
+    // Selection-menu hit-test runs before anything else so the buttons stay
+    // clickable even while a selection is active.
+    if let MouseEventKind::Down(MouseButton::Left) = m.kind {
+        if let Some(action) = ui::selection_menu_hit(state, m.column, m.row) {
+            match action {
+                ui::SelectionMenuAction::Copy => {
+                    if let Some(text) = state.selection_text() {
+                        let n = state.selection_lines().len();
+                        match clipboard::copy(&text) {
+                            Ok(_) => state.status = Some(format!("copied {n} line(s)")),
+                            Err(e) => state.status = Some(format!("clipboard error: {e}")),
+                        }
+                    }
+                    state.clear_selection();
+                }
+                ui::SelectionMenuAction::Comment => open_composer(state, composer),
+                ui::SelectionMenuAction::Cancel => {
+                    state.clear_selection();
+                    state.status = Some("selection cleared".into());
+                }
+            }
+            return;
+        }
+        // A click outside the menu drops a finished selection.
+        if let Some(sel) = state.selection {
+            if !sel.dragging {
+                state.clear_selection();
+            }
+        }
     }
     let body_top = state.body_top;
     let row_to_idx = |row: u16| -> Option<usize> {
@@ -483,12 +596,18 @@ fn handle_mouse(
         }
         MouseEventKind::Up(MouseButton::Left) => {
             if let Some(sel) = state.selection {
-                if !sel.dragging || sel.start == sel.end {
-                    // also covers true single-click (no drag movement)
-                }
+                let single_click = sel.start == sel.end;
                 state.finish_selection();
-                if !state.selection_lines().is_empty() {
-                    open_composer(state, composer);
+                if single_click {
+                    // No drag → treat as a cursor move on the clicked line,
+                    // not a 1-line selection. The floating menu won't appear.
+                    state.cursor = sel.start;
+                    state.cursor_visible = true;
+                    state.clear_selection();
+                } else {
+                    // Multi-line drag → keep the selection so the menu (drawn
+                    // by ui::draw) offers copy / comment.
+                    state.cursor = sel.range().1;
                 }
             }
         }
