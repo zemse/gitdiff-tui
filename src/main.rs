@@ -77,7 +77,24 @@ fn main() -> Result<()> {
             }
         }
     }
-    if merged_any {
+    // One-shot dedup of accumulated reply duplicates. Pre-fix builds wrote
+    // REVIEW.md with second-precision timestamps; on relaunch the merger
+    // compared the parsed reply (seconds) against the in-memory one
+    // (microseconds), found them unequal and appended a copy. Collapse those
+    // by `(author, body, timestamp-truncated-to-seconds)` and keep the first
+    // (usually the highest-precision) occurrence.
+    let mut deduped_any = false;
+    for d in drafts.iter_mut() {
+        let before = d.replies.len();
+        let mut seen: std::collections::HashSet<(String, String, i64)> =
+            std::collections::HashSet::new();
+        d.replies
+            .retain(|r| seen.insert((r.author.clone(), r.body.clone(), r.created_at.timestamp())));
+        if d.replies.len() != before {
+            deduped_any = true;
+        }
+    }
+    if merged_any || deduped_any {
         let _ = review::save_drafts(&root, &source, &drafts);
     }
     let mut viewed = review::load_viewed(&root, &source).unwrap_or_default();

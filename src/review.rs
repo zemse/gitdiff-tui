@@ -198,9 +198,16 @@ fn write_section<'a>(out: &mut String, _label: &str, ds: impl Iterator<Item = &'
                 out.push_str(&format!("\nReactions: {}\n", d.reactions.join(" ")));
             }
             // Replies block — agents must edit only inside this delimiter pair.
+            // Timestamps include sub-second precision so the parser round-trips
+            // a reply back to the exact same Reply on the next launch (avoids
+            // the duplicate-on-merge bug). A blank line separates consecutive
+            // replies so the parser doesn't fold them into one multi-line body.
             out.push_str(&format!("\n<!-- replies:{tid} -->\n"));
-            for r in &d.replies {
-                let ts = r.created_at.format("%Y-%m-%dT%H:%M:%SZ");
+            for (ri, r) in d.replies.iter().enumerate() {
+                if ri > 0 {
+                    out.push('\n');
+                }
+                let ts = r.created_at.format("%Y-%m-%dT%H:%M:%S%.6fZ");
                 if r.body.is_empty() {
                     out.push_str(&format!("> [@{} {}]\n", r.author, ts));
                 } else {
