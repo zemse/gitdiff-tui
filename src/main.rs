@@ -34,7 +34,49 @@ fn main() -> Result<()> {
     let raw = git::get_diff(&root, &source, opts)?;
     let files = diff::parse(&raw)?;
 
-    let drafts = review::load_drafts(&root, &source)?;
+    let mut drafts = review::load_drafts(&root, &source)?;
+    // Backfill thread_ids on drafts saved before the threads feature shipped,
+    // so they survive the next round-trip with stable IDs.
+    for d in drafts.iter_mut() {
+        if d.thread_id.is_empty() {
+            d.thread_id = app::make_thread_id(
+                &d.file_path,
+                d.old_lineno,
+                d.new_lineno,
+                &d.created_at,
+            );
+        }
+    }
+    // Merge any agent replies that have been added to the REVIEW-*.md file
+    // since the last submit. The JSON store is canonical, so we re-save once
+    // merged to make the imported replies durable.
+    let mut merged_any = false;
+    let review_p = review::review_path(&root, &source);
+    if review_p.exists() {
+        if let Ok(text) = std::fs::read_to_string(&review_p) {
+            let map = review::parse_review_replies(&text);
+            for d in drafts.iter_mut() {
+                if let Some(new_replies) = map.get(&d.thread_id) {
+                    // Append only replies we haven't already stored (dedupe by
+                    // (author, created_at, body)).
+                    for r in new_replies {
+                        let dup = d.replies.iter().any(|x| {
+                            x.author == r.author
+                                && x.created_at == r.created_at
+                                && x.body == r.body
+                        });
+                        if !dup {
+                            d.replies.push(r.clone());
+                            merged_any = true;
+                        }
+                    }
+                }
+            }
+        }
+    }
+    if merged_any {
+        let _ = review::save_drafts(&root, &source, &drafts);
+    }
     let viewed = review::load_viewed(&root, &source).unwrap_or_default();
     let mut state = AppState::new(source.clone(), source_label, files, drafts, viewed);
     state.opts = opts;

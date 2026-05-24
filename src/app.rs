@@ -50,6 +50,23 @@ pub struct Draft {
     pub outdated: bool,
     #[serde(default)]
     pub reactions: Vec<String>,
+    /// Stable identifier so agents can target a specific thread when replying
+    /// inside REVIEW-*.md. Empty on drafts loaded from pre-thread JSON; the
+    /// startup loader backfills any missing IDs.
+    #[serde(default)]
+    pub thread_id: String,
+    /// Conversation replies — parsed back from REVIEW-*.md `<!-- replies:tID -->`
+    /// blocks on launch, then preserved through subsequent submits.
+    #[serde(default)]
+    pub replies: Vec<Reply>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct Reply {
+    /// Free-form (e.g. "you", "claude-code", "codex"). Agents pick their own.
+    pub author: String,
+    pub body: String,
+    pub created_at: DateTime<Utc>,
 }
 
 pub const REACTION_CYCLE: &[&str] = &["👍", "👎", "🎉", "😄", "❤️", "🚀", "👀", "❓"];
@@ -358,15 +375,23 @@ impl AppState {
                             if self.editing_draft_idx == Some(di) {
                                 continue;
                             }
-                            let body_lines = wrap_body(
-                                &self.drafts[di].body,
-                                draft_text_width(self.body_width),
-                            )
-                            .len()
-                            .max(1);
+                            let max_w = draft_text_width(self.body_width);
+                            let body_lines = wrap_body(&self.drafts[di].body, max_w)
+                                .len()
+                                .max(1);
                             let has_react = !self.drafts[di].reactions.is_empty();
-                            // 2 border rows (top + bottom) + body + optional reactions.
-                            let total_rows = 2 + body_lines + if has_react { 1 } else { 0 };
+                            // Each reply contributes: 1 header divider row +
+                            // its wrapped body rows.
+                            let reply_rows: usize = self.drafts[di]
+                                .replies
+                                .iter()
+                                .map(|r| 1 + wrap_body(&r.body, max_w).len().max(1))
+                                .sum();
+                            // 2 border rows (top + bottom) + body + replies + optional reactions.
+                            let total_rows = 2
+                                + body_lines
+                                + reply_rows
+                                + if has_react { 1 } else { 0 };
                             for sub in 0..total_rows {
                                 out.push(FlatLine {
                                     kind: FlatKind::DraftRow,
@@ -1068,6 +1093,13 @@ impl AppState {
             self.drafts[idx].diff_snippet = snippet;
             return Some(());
         }
+        let created_at = Utc::now();
+        let thread_id = make_thread_id(
+            &file.path,
+            last_line.old_lineno,
+            last_line.new_lineno,
+            &created_at,
+        );
         self.drafts.push(Draft {
             file_path: file.path.clone(),
             old_lineno: last_line.old_lineno,
@@ -1077,10 +1109,12 @@ impl AppState {
             line_kind: kind.to_string(),
             diff_snippet: snippet,
             body,
-            created_at: Utc::now(),
+            created_at,
             resolved: false,
             outdated: false,
             reactions: Vec::new(),
+            thread_id,
+            replies: Vec::new(),
         });
         Some(())
     }
@@ -1266,6 +1300,25 @@ fn precompute_highlights(files: &[FileDiff]) -> HashMap<LineKey, Vec<HSpan>> {
 fn fuzzy_match(haystack: &str, needle: &str) -> bool {
     let mut it = haystack.chars();
     needle.chars().all(|c| it.any(|h| h == c))
+}
+
+/// Generates a stable thread identifier for a freshly created draft. Combines
+/// the anchor location with the creation timestamp so re-creating a draft on
+/// the same line yields a fresh ID (and therefore a fresh thread).
+pub fn make_thread_id(
+    file_path: &str,
+    old_lineno: Option<usize>,
+    new_lineno: Option<usize>,
+    created_at: &DateTime<Utc>,
+) -> String {
+    use std::collections::hash_map::DefaultHasher;
+    use std::hash::{Hash, Hasher};
+    let mut h = DefaultHasher::new();
+    file_path.hash(&mut h);
+    old_lineno.hash(&mut h);
+    new_lineno.hash(&mut h);
+    created_at.timestamp_micros().hash(&mut h);
+    format!("t_{:08x}", (h.finish() & 0xffff_ffff) as u32)
 }
 
 /// Splits `body` into display rows that fit within `max_w` characters.

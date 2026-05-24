@@ -959,12 +959,21 @@ fn render_draft_row(state: &AppState, draft_idx: usize, sub: usize, width: usize
 
     // Box must be at least 2 cols wide (for the two corner glyphs).
     let inner_w = width.saturating_sub(2);
+    let text_w = inner_w.saturating_sub(1);
     // Pre-wrap body so each display row is its own bordered sub-row; this is
     // the same wrap rebuild_flat uses to size the box, so they always agree.
-    let body_lines = app::wrap_body(&d.body, inner_w.saturating_sub(1));
+    let body_lines = app::wrap_body(&d.body, text_w);
     let body_count = body_lines.len().max(1);
+    // Per-reply pre-wrap; each reply produces `1 + wrapped_lines` sub-rows
+    // (1 header divider, then wrapped body).
+    let reply_wraps: Vec<Vec<String>> = d
+        .replies
+        .iter()
+        .map(|r| app::wrap_body(&r.body, text_w))
+        .collect();
+    let reply_rows: usize = reply_wraps.iter().map(|w| 1 + w.len().max(1)).sum();
     let has_react = !d.reactions.is_empty();
-    let total = 2 + body_count + if has_react { 1 } else { 0 };
+    let total = 2 + body_count + reply_rows + if has_react { 1 } else { 0 };
     let bottom_idx = total - 1;
 
     // Top edge with title — mirrors a ratatui Block's title placement.
@@ -1004,14 +1013,66 @@ fn render_draft_row(state: &AppState, draft_idx: usize, sub: usize, width: usize
         ]);
     }
 
-    // Content rows: body lines, then (optionally) reactions.
-    let label = if sub <= body_count {
-        let bi = sub - 1;
+    // Sub layout (after top edge at sub=0):
+    //   1..=body_count                              → body wrapped row
+    //   body_count+1..body_count+reply_rows         → reply header + wrapped body
+    //   the trailing reactions row (if present)     → just before bottom_idx
+    //   bottom_idx                                  → bottom edge
+    let mut idx_in_body = sub.saturating_sub(1);
+
+    if idx_in_body < body_count {
+        let bi = idx_in_body;
         let txt = body_lines.get(bi).map(|s| s.as_str()).unwrap_or("");
-        format!(" {txt}")
-    } else {
-        format!(" {}", d.reactions.join(" "))
-    };
+        let label = format!(" {txt}");
+        let used = label.chars().count();
+        let pad = inner_w.saturating_sub(used);
+        return Line::from(vec![
+            Span::styled("│".to_string(), border),
+            Span::styled(label, text),
+            Span::styled(" ".repeat(pad), bg),
+            Span::styled("│".to_string(), border),
+        ]);
+    }
+    idx_in_body -= body_count;
+
+    // Walk replies to find the (reply_idx, row_within_reply) for this sub.
+    for (ri, wrap) in reply_wraps.iter().enumerate() {
+        let block = 1 + wrap.len().max(1);
+        if idx_in_body < block {
+            let reply = &d.replies[ri];
+            if idx_in_body == 0 {
+                // Reply header: `├─ @author · 2026-05-24 17:05 ─...─┤`
+                let ts = reply.created_at.format("%Y-%m-%d %H:%M").to_string();
+                let header = format!(" ↳ @{} · {} ", reply.author, ts);
+                let header_chars = header.chars().count();
+                let dashes = inner_w.saturating_sub(header_chars);
+                return Line::from(vec![
+                    Span::styled("├".to_string(), border),
+                    Span::styled(
+                        header,
+                        muted.add_modifier(Modifier::ITALIC | Modifier::BOLD),
+                    ),
+                    Span::styled("─".repeat(dashes), border),
+                    Span::styled("┤".to_string(), border),
+                ]);
+            }
+            let row = idx_in_body - 1;
+            let txt = wrap.get(row).map(|s| s.as_str()).unwrap_or("");
+            let label = format!(" {txt}");
+            let used = label.chars().count();
+            let pad = inner_w.saturating_sub(used);
+            return Line::from(vec![
+                Span::styled("│".to_string(), border),
+                Span::styled(label, text),
+                Span::styled(" ".repeat(pad), bg),
+                Span::styled("│".to_string(), border),
+            ]);
+        }
+        idx_in_body -= block;
+    }
+
+    // Reactions row (only reachable when has_react == true).
+    let label = format!(" {}", d.reactions.join(" "));
     let used = label.chars().count();
     let pad = inner_w.saturating_sub(used);
     Line::from(vec![
@@ -1430,6 +1491,8 @@ fn draw_help(f: &mut Frame, area: Rect) {
         Line::from("  x            delete comment on current line"),
         Line::from("  ctrl-d       delete comment from edit mode (in composer)"),
         Line::from("  S            submit drafts → REVIEW.md at repo root"),
+        Line::from("               (agents may reply inside <!-- replies:tID --> blocks;"),
+        Line::from("                replies are merged back on next launch)"),
         Line::from(""),
         Line::from("  mouse        click to move cursor, click header to collapse, wheel to scroll"),
         Line::from(""),
