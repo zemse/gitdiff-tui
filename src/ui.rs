@@ -1,4 +1,4 @@
-use crate::app::{AppState, FlatKind, IntraRange, LineKey, Mode};
+use crate::app::{self, AppState, FlatKind, IntraRange, LineKey, Mode};
 use crate::diff::{FileStatus, LineKind};
 use crate::syntax::Span as HSpan;
 use ratatui::Frame;
@@ -20,11 +20,21 @@ pub fn draw(f: &mut Frame, state: &mut AppState, composer: Option<&mut TextArea<
     // user sees the full comment while editing. Capped so it never overflows
     // the viewport.
     if state.mode == Mode::Composing {
-        let content_lines = composer
+        // Count display rows after wrapping: the composer renders text wrapped
+        // so its height must reflect the wrapped row count, not just the
+        // newline-separated line count.
+        let inner_w = composer_inner_width(state) as usize;
+        let display_rows = composer
             .as_ref()
-            .map(|ta| ta.lines().len().max(1))
+            .map(|ta| {
+                ta.lines()
+                    .iter()
+                    .map(|l| wrapped_row_count(l, inner_w))
+                    .sum::<usize>()
+                    .max(1)
+            })
             .unwrap_or(1);
-        let desired = (content_lines as u16).saturating_add(2);
+        let desired = (display_rows as u16).saturating_add(2);
         let cap = (state.viewport_height as u16).saturating_sub(2).max(COMPOSER_MIN_H);
         state.composer_height = desired.clamp(COMPOSER_MIN_H, cap);
     } else {
@@ -71,6 +81,12 @@ pub fn draw(f: &mut Frame, state: &mut AppState, composer: Option<&mut TextArea<
     state.body_top = body_area.y;
     state.body_x = body_area.x;
     state.body_width = body_area.width;
+    // Re-flatten on first frame and on resize so wrapped-draft row counts
+    // match the body width currently in use.
+    if state.flat_for_body_width != state.body_width {
+        state.rebuild_flat();
+        state.flat_for_body_width = state.body_width;
+    }
     draw_body(f, body_area, state);
     draw_footer(f, vert[2], state);
 
@@ -942,13 +958,15 @@ fn render_draft_row(state: &AppState, draft_idx: usize, sub: usize, width: usize
     let text = bg.fg(Color::Rgb(220, 230, 245));
     let muted = bg.fg(Color::Rgb(150, 160, 180));
 
-    let body_lines: Vec<&str> = d.body.lines().collect();
+    // Box must be at least 2 cols wide (for the two corner glyphs).
+    let inner_w = width.saturating_sub(2);
+    // Pre-wrap body so each display row is its own bordered sub-row; this is
+    // the same wrap rebuild_flat uses to size the box, so they always agree.
+    let body_lines = app::wrap_body(&d.body, inner_w.saturating_sub(1));
     let body_count = body_lines.len().max(1);
     let has_react = !d.reactions.is_empty();
     let total = 2 + body_count + if has_react { 1 } else { 0 };
     let bottom_idx = total - 1;
-    // Box must be at least 2 cols wide (for the two corner glyphs).
-    let inner_w = width.saturating_sub(2);
 
     // Top edge with title — mirrors a ratatui Block's title placement.
     if sub == 0 {
@@ -990,7 +1008,7 @@ fn render_draft_row(state: &AppState, draft_idx: usize, sub: usize, width: usize
     // Content rows: body lines, then (optionally) reactions.
     let label = if sub <= body_count {
         let bi = sub - 1;
-        let txt = body_lines.get(bi).copied().unwrap_or("");
+        let txt = body_lines.get(bi).map(|s| s.as_str()).unwrap_or("");
         format!(" {txt}")
     } else {
         format!(" {}", d.reactions.join(" "))
@@ -1106,6 +1124,66 @@ fn composer_rect(body: Rect, state: &AppState) -> Rect {
     }
 }
 
+/// Inner content width of the composer popup. Matches `composer_rect` width
+/// minus 2 borders and 2 padding columns (`Padding::horizontal(1)`).
+pub fn composer_inner_width(state: &AppState) -> u16 {
+    let total = state.body_width.saturating_sub(1).max(20);
+    total.saturating_sub(4)
+}
+
+/// Maps a click on display row/col inside the wrapped composer back to a
+/// logical (row, col) the textarea understands. Clicks past the rendered text
+/// snap to the end of the closest logical line.
+pub fn composer_screen_to_logical(
+    ta: &TextArea<'_>,
+    inner_w: usize,
+    local_row: u16,
+    local_col: u16,
+) -> (u16, u16) {
+    let w = inner_w.max(1);
+    let target = local_row as usize;
+    let mut display_row = 0usize;
+    for (li, line) in ta.lines().iter().enumerate() {
+        let n = line.chars().count();
+        let rows = if n == 0 { 1 } else { (n + w - 1) / w };
+        if target < display_row + rows {
+            let r = target - display_row;
+            let start = r * w;
+            let row_len = if n == 0 {
+                0
+            } else if r + 1 == rows {
+                n - start
+            } else {
+                w
+            };
+            let col = (local_col as usize).min(row_len);
+            return (li as u16, (start + col) as u16);
+        }
+        display_row += rows;
+    }
+    let lines = ta.lines();
+    let last_li = lines.len().saturating_sub(1) as u16;
+    let last_col = lines.last().map(|l| l.chars().count()).unwrap_or(0) as u16;
+    (last_li, last_col)
+}
+
+/// How many display rows `line` occupies after wrapping into `max_w` chars.
+/// Empty lines and the trailing edge of `max_w`-aligned lines still take one
+/// row.
+fn wrapped_row_count(line: &str, max_w: usize) -> usize {
+    if max_w == 0 {
+        return 1;
+    }
+    let n = line.chars().count();
+    if n == 0 {
+        1
+    } else {
+        (n + max_w - 1) / max_w
+    }
+}
+
+const COMPOSER_BG: Color = Color::Rgb(20, 28, 40);
+
 fn draw_composer(f: &mut Frame, popup: Rect, state: &AppState, ta: &mut TextArea<'_>) {
     f.render_widget(Clear, popup);
 
@@ -1114,12 +1192,166 @@ fn draw_composer(f: &mut Frame, popup: Rect, state: &AppState, ta: &mut TextArea
         .borders(Borders::ALL)
         .title(title)
         .border_style(Style::default().fg(Color::Yellow))
-        .style(Style::default().bg(Color::Rgb(20, 28, 40)))
+        .style(Style::default().bg(COMPOSER_BG))
         // Match the read-only draft view, which leaves a 1-col gap between
         // the border and the body text.
         .padding(Padding::horizontal(1));
-    ta.set_block(block);
-    f.render_widget(&*ta, popup);
+    let inner = block.inner(popup);
+    f.render_widget(block, popup);
+
+    if inner.width == 0 || inner.height == 0 {
+        return;
+    }
+
+    let max_w = inner.width as usize;
+    let max_h = inner.height as usize;
+    // Wrap each logical line; for each display row, remember which logical
+    // line (`li`) and starting column (`start`) it represents. We need this
+    // mapping to translate the textarea's logical cursor into a display
+    // (row, col) and to overlay the selection.
+    let mut display: Vec<String> = Vec::new();
+    let mut row_map: Vec<(usize, usize)> = Vec::new();
+    for (li, line) in ta.lines().iter().enumerate() {
+        if line.is_empty() {
+            display.push(String::new());
+            row_map.push((li, 0));
+            continue;
+        }
+        let chars: Vec<char> = line.chars().collect();
+        let mut i = 0;
+        while i < chars.len() {
+            let end = (i + max_w).min(chars.len());
+            display.push(chars[i..end].iter().collect());
+            row_map.push((li, i));
+            i = end;
+        }
+    }
+    if display.is_empty() {
+        display.push(String::new());
+        row_map.push((0, 0));
+    }
+
+    // Where is the cursor on the wrapped canvas?
+    let (cr, cc) = ta.cursor();
+    let (cursor_row, cursor_col) = locate_cursor(&row_map, &display, cr, cc, max_w);
+
+    // Scroll so the cursor row stays inside the visible inner area.
+    let scroll = if cursor_row >= max_h {
+        cursor_row + 1 - max_h
+    } else {
+        0
+    };
+
+    let sel = ta.selection_range();
+    let sel_style = ta.selection_style();
+    let text_style = ta.style();
+
+    let from = scroll;
+    let to = (scroll + max_h).min(display.len());
+    let mut lines: Vec<Line<'static>> = Vec::with_capacity(to - from);
+    for di in from..to {
+        lines.push(render_composer_row(
+            &display[di],
+            row_map[di],
+            sel,
+            sel_style,
+            text_style,
+        ));
+    }
+    let para = Paragraph::new(lines).style(text_style.bg(COMPOSER_BG));
+    f.render_widget(para, inner);
+
+    // Place the terminal cursor — tui-textarea's own widget normally does this;
+    // since we render our own, we have to position it ourselves.
+    if cursor_row >= scroll && cursor_row - scroll < max_h {
+        let cx = inner.x + cursor_col.min((max_w.saturating_sub(1)).max(0)) as u16;
+        let cy = inner.y + (cursor_row - scroll) as u16;
+        f.set_cursor_position((cx, cy));
+    }
+}
+
+/// Maps a logical `(cr, cc)` cursor onto the wrapped display canvas.
+fn locate_cursor(
+    row_map: &[(usize, usize)],
+    display: &[String],
+    cr: usize,
+    cc: usize,
+    max_w: usize,
+) -> (usize, usize) {
+    if max_w == 0 || row_map.is_empty() {
+        return (0, 0);
+    }
+    // Walk the rows belonging to logical line `cr`; pick the one whose
+    // [start, start+len] range contains `cc`. If the cursor sits past the last
+    // chunk (e.g. just-typed character at end), put it at the trailing edge.
+    let mut last_for_line: Option<usize> = None;
+    for (di, (li, start)) in row_map.iter().enumerate() {
+        if *li != cr {
+            continue;
+        }
+        last_for_line = Some(di);
+        let row_chars = display[di].chars().count();
+        if cc >= *start && cc <= *start + row_chars {
+            // Cursor lands inside this row, or just at its end.
+            // If the cursor is exactly at start+max_w (we filled the row),
+            // and there's another row for this logical line that begins where
+            // we ended, prefer placing the cursor at column 0 of the next row.
+            let col = cc - *start;
+            if col >= max_w {
+                if let Some((nli, _)) = row_map.get(di + 1) {
+                    if *nli == cr {
+                        return (di + 1, 0);
+                    }
+                }
+            }
+            return (di, col);
+        }
+    }
+    if let Some(di) = last_for_line {
+        let col = display[di].chars().count();
+        return (di, col);
+    }
+    (0, 0)
+}
+
+/// Builds one display row with optional selection highlighting.
+fn render_composer_row(
+    text: &str,
+    row_meta: (usize, usize),
+    sel: Option<((usize, usize), (usize, usize))>,
+    sel_style: Style,
+    base_style: Style,
+) -> Line<'static> {
+    let (li, start) = row_meta;
+    let chars: Vec<char> = text.chars().collect();
+    let len = chars.len();
+    // Compute selection overlap as char offsets within this display row.
+    let sel_in_row = sel.and_then(|((sr, sc), (er, ec))| {
+        if li < sr || li > er {
+            return None;
+        }
+        let abs_start = if li == sr { sc } else { 0 };
+        let abs_end = if li == er { ec } else { start + len };
+        let local_start = abs_start.saturating_sub(start);
+        let local_end = abs_end.saturating_sub(start).min(len);
+        if local_start >= local_end {
+            return None;
+        }
+        Some((local_start, local_end))
+    });
+    match sel_in_row {
+        None => Line::from(Span::styled(text.to_string(), base_style.bg(COMPOSER_BG))),
+        Some((s, e)) => {
+            let pre: String = chars[..s].iter().collect();
+            let mid: String = chars[s..e].iter().collect();
+            let post: String = chars[e..].iter().collect();
+            Line::from(vec![
+                Span::styled(pre, base_style.bg(COMPOSER_BG)),
+                Span::styled(mid, sel_style),
+                Span::styled(post, base_style.bg(COMPOSER_BG)),
+            ])
+        }
+    }
 }
 
 fn build_composer_title(state: &AppState) -> String {

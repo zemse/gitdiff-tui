@@ -184,6 +184,9 @@ pub struct AppState {
     // Geometry of the floating copy/comment menu shown after a drag selection.
     // Used for hit-testing clicks on its buttons.
     pub selection_menu_rect: Option<(u16, u16, u16, u16)>,
+    // `body_width` last used when computing `flat`. Drives a re-flatten on
+    // resize so draft sub-row counts match the new wrap.
+    pub flat_for_body_width: u16,
 }
 
 #[derive(Debug, Clone)]
@@ -244,6 +247,7 @@ impl AppState {
             editing_draft_idx: None,
             composer_rect: None,
             selection_menu_rect: None,
+            flat_for_body_width: 0,
         };
         // start on first code line if possible
         if let Some(i) = s.flat.iter().position(|l| l.kind == FlatKind::Code) {
@@ -351,7 +355,12 @@ impl AppState {
                             if self.editing_draft_idx == Some(di) {
                                 continue;
                             }
-                            let body_lines = self.drafts[di].body.lines().count().max(1);
+                            let body_lines = wrap_body(
+                                &self.drafts[di].body,
+                                draft_text_width(self.body_width),
+                            )
+                            .len()
+                            .max(1);
                             let has_react = !self.drafts[di].reactions.is_empty();
                             // 2 border rows (top + bottom) + body + optional reactions.
                             let total_rows = 2 + body_lines + if has_react { 1 } else { 0 };
@@ -1245,6 +1254,40 @@ fn precompute_highlights(files: &[FileDiff]) -> HashMap<LineKey, Vec<HSpan>> {
 fn fuzzy_match(haystack: &str, needle: &str) -> bool {
     let mut it = haystack.chars();
     needle.chars().all(|c| it.any(|h| h == c))
+}
+
+/// Splits `body` into display rows that fit within `max_w` characters.
+/// Empty `body` yields a single empty row. `max_w == 0` falls back to one
+/// row per logical line.
+pub fn wrap_body(body: &str, max_w: usize) -> Vec<String> {
+    let mut out = Vec::new();
+    for line in body.lines() {
+        if line.is_empty() {
+            out.push(String::new());
+            continue;
+        }
+        if max_w == 0 {
+            out.push(line.to_string());
+            continue;
+        }
+        let chars: Vec<char> = line.chars().collect();
+        let mut i = 0;
+        while i < chars.len() {
+            let end = (i + max_w).min(chars.len());
+            out.push(chars[i..end].iter().collect());
+            i = end;
+        }
+    }
+    if out.is_empty() {
+        out.push(String::new());
+    }
+    out
+}
+
+/// Usable text width inside a rendered draft box for the given diff body
+/// width (subtracts 2 borders and 1 leading-padding column).
+pub fn draft_text_width(body_width: u16) -> usize {
+    (body_width as usize).saturating_sub(3)
 }
 
 fn build_range_snippet(file: &FileDiff, keys: &[LineKey]) -> String {

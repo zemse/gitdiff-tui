@@ -424,18 +424,22 @@ fn handle_composer_mouse(
         return;
     }
     let Some(ta) = composer.as_mut() else { return };
-    let local_col = (m.column - inner_x) as u16;
-    let local_row = (m.row - inner_y) as u16;
+    let local_col = m.column - inner_x;
+    let local_row = m.row - inner_y;
+    // The composer wraps long lines, so screen (row, col) is not the same as
+    // textarea (logical_row, logical_col). Translate before jumping.
+    let inner_w = ui::composer_inner_width(state) as usize;
+    let (jrow, jcol) = ui::composer_screen_to_logical(ta, inner_w, local_row, local_col);
     match m.kind {
         MouseEventKind::Down(MouseButton::Left) => {
             ta.cancel_selection();
-            ta.move_cursor(CursorMove::Jump(local_row, local_col));
+            ta.move_cursor(CursorMove::Jump(jrow, jcol));
             ta.start_selection();
         }
         MouseEventKind::Drag(MouseButton::Left) => {
             // Selection is anchored at the Down position; moving the cursor
             // while `is_selecting()` extends it (move_cursor passes shift=true).
-            ta.move_cursor(CursorMove::Jump(local_row, local_col));
+            ta.move_cursor(CursorMove::Jump(jrow, jcol));
         }
         MouseEventKind::Up(MouseButton::Left) => {
             // If the drag never moved, drop the empty selection so the cursor
