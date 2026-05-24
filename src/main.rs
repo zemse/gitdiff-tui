@@ -80,7 +80,17 @@ fn main() -> Result<()> {
     if merged_any {
         let _ = review::save_drafts(&root, &source, &drafts);
     }
-    let viewed = review::load_viewed(&root, &source).unwrap_or_default();
+    let mut viewed = review::load_viewed(&root, &source).unwrap_or_default();
+    // Drop viewed marks whose stored hash no longer matches the file's current
+    // diff content — that's the "this file changed since you marked it viewed,
+    // please look again" signal.
+    {
+        let current: std::collections::HashMap<String, String> = files
+            .iter()
+            .map(|f| (f.path.clone(), app::file_diff_hash(f)))
+            .collect();
+        viewed.retain(|path, stored_hash| current.get(path) == Some(stored_hash));
+    }
     let mut state = AppState::new(source.clone(), source_label, files, drafts, viewed);
     state.opts = opts;
     state.mark_outdated_drafts();

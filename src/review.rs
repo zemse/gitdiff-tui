@@ -2,7 +2,7 @@ use crate::app::{Draft, Reply, Verdict};
 use crate::git::DiffSource;
 use anyhow::{Context, Result};
 use chrono::{DateTime, Utc};
-use std::collections::{BTreeMap, HashMap, HashSet};
+use std::collections::{BTreeMap, HashMap};
 use std::fs;
 use std::path::{Path, PathBuf};
 
@@ -20,28 +20,42 @@ pub fn review_path(root: &Path, source: &DiffSource) -> PathBuf {
     root.join(format!("REVIEW-{}.md", source.slug()))
 }
 
-pub fn load_viewed(root: &Path, source: &DiffSource) -> Result<HashSet<String>> {
+/// Viewed entries store a hash of the file's diff content at the time the
+/// user marked it viewed. On load we drop entries whose hash no longer matches
+/// the current diff, so re-edits clear the tick automatically.
+pub fn load_viewed(root: &Path, source: &DiffSource) -> Result<HashMap<String, String>> {
     let p = viewed_path(root, source);
     if !p.exists() {
-        return Ok(HashSet::new());
+        return Ok(HashMap::new());
     }
     let raw = fs::read_to_string(&p).with_context(|| format!("read {}", p.display()))?;
     if raw.trim().is_empty() {
-        return Ok(HashSet::new());
+        return Ok(HashMap::new());
     }
-    let v: Vec<String> =
-        serde_json::from_str(&raw).with_context(|| format!("parse {}", p.display()))?;
-    Ok(v.into_iter().collect())
+    if let Ok(m) = serde_json::from_str::<HashMap<String, String>>(&raw) {
+        return Ok(m);
+    }
+    // Fall back to the pre-hash array format. Entries land with empty hashes,
+    // which will fail the hash check at startup and be cleared — that's the
+    // intended behaviour for a one-time format upgrade.
+    if let Ok(v) = serde_json::from_str::<Vec<String>>(&raw) {
+        return Ok(v.into_iter().map(|p| (p, String::new())).collect());
+    }
+    Ok(HashMap::new())
 }
 
-pub fn save_viewed(root: &Path, source: &DiffSource, viewed: &HashSet<String>) -> Result<()> {
+pub fn save_viewed(
+    root: &Path,
+    source: &DiffSource,
+    viewed: &HashMap<String, String>,
+) -> Result<()> {
     let p = viewed_path(root, source);
     if let Some(dir) = p.parent() {
         fs::create_dir_all(dir)?;
     }
-    let mut v: Vec<&String> = viewed.iter().collect();
-    v.sort();
-    fs::write(&p, serde_json::to_string_pretty(&v)?)
+    // BTreeMap for stable key ordering in the on-disk file.
+    let sorted: BTreeMap<&String, &String> = viewed.iter().collect();
+    fs::write(&p, serde_json::to_string_pretty(&sorted)?)
         .with_context(|| format!("write {}", p.display()))?;
     Ok(())
 }

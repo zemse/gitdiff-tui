@@ -181,7 +181,7 @@ pub struct AppState {
     pub selection: Option<Selection>,
     pub cursor_visible: bool,
     pub body_top: u16,
-    pub viewed: HashSet<String>,
+    pub viewed: HashMap<String, String>,
     pub show_tree: bool,
     pub show_drafts_pane: bool,
     pub opts: DiffOpts,
@@ -221,10 +221,10 @@ impl AppState {
         source_label: String,
         files: Vec<FileDiff>,
         drafts: Vec<Draft>,
-        viewed: HashSet<String>,
+        viewed: HashMap<String, String>,
     ) -> Self {
         // viewed files start collapsed
-        let expanded: Vec<bool> = files.iter().map(|f| !viewed.contains(&f.path)).collect();
+        let expanded: Vec<bool> = files.iter().map(|f| !viewed.contains_key(&f.path)).collect();
         let flat = flatten(&files, &expanded, &HashMap::new());
         let total_additions = files.iter().map(|f| f.additions).sum();
         let total_deletions = files.iter().map(|f| f.deletions).sum();
@@ -531,11 +531,14 @@ impl AppState {
     pub fn toggle_viewed(&mut self, file_idx: usize) -> Option<bool> {
         let file = self.files.get(file_idx)?;
         let path = file.path.clone();
-        let now_viewed = if self.viewed.contains(&path) {
+        let now_viewed = if self.viewed.contains_key(&path) {
             self.viewed.remove(&path);
             false
         } else {
-            self.viewed.insert(path);
+            // Stamp the current diff-content hash so a later edit clears the
+            // tick automatically on next launch.
+            let hash = file_diff_hash(file);
+            self.viewed.insert(path, hash);
             true
         };
         if let Some(e) = self.expanded.get_mut(file_idx) {
@@ -550,7 +553,7 @@ impl AppState {
     pub fn viewed_count(&self) -> usize {
         self.files
             .iter()
-            .filter(|f| self.viewed.contains(&f.path))
+            .filter(|f| self.viewed.contains_key(&f.path))
             .count()
     }
 
@@ -739,7 +742,7 @@ impl AppState {
     }
 
     pub fn replace_files(&mut self, files: Vec<FileDiff>) {
-        let expanded: Vec<bool> = files.iter().map(|f| !self.viewed.contains(&f.path)).collect();
+        let expanded: Vec<bool> = files.iter().map(|f| !self.viewed.contains_key(&f.path)).collect();
         let total_additions = files.iter().map(|f| f.additions).sum();
         let total_deletions = files.iter().map(|f| f.deletions).sum();
         let highlights = precompute_highlights(&files);
@@ -1311,6 +1314,27 @@ fn precompute_highlights(files: &[FileDiff]) -> HashMap<LineKey, Vec<HSpan>> {
 fn fuzzy_match(haystack: &str, needle: &str) -> bool {
     let mut it = haystack.chars();
     needle.chars().all(|c| it.any(|h| h == c))
+}
+
+/// Hashes a file's diff content (all hunks + line numbers + kinds) so we can
+/// detect when the diff for that file has changed. Used to expire the
+/// per-file "viewed" tick automatically.
+pub fn file_diff_hash(file: &FileDiff) -> String {
+    use std::collections::hash_map::DefaultHasher;
+    use std::hash::{Hash, Hasher};
+    let mut h = DefaultHasher::new();
+    file.path.hash(&mut h);
+    for hk in &file.hunks {
+        hk.old_start.hash(&mut h);
+        hk.old_count.hash(&mut h);
+        hk.new_start.hash(&mut h);
+        hk.new_count.hash(&mut h);
+        for l in &hk.lines {
+            (l.kind as u8).hash(&mut h);
+            l.content.hash(&mut h);
+        }
+    }
+    format!("{:016x}", h.finish())
 }
 
 /// Generates a stable thread identifier for a freshly created draft. Combines

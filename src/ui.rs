@@ -127,7 +127,7 @@ fn draw_tree(f: &mut Frame, area: Rect, state: &AppState) {
     let mut lines: Vec<Line<'static>> = Vec::new();
     let current_fi = state.flat.get(state.cursor).map(|fl| fl.file_idx);
     for (i, file) in state.files.iter().enumerate() {
-        let viewed = state.viewed.contains(&file.path);
+        let viewed = state.viewed.contains_key(&file.path);
         let selected = current_fi == Some(i);
         let badge = match file.status {
             FileStatus::Added => "A",
@@ -653,7 +653,7 @@ fn draw_scrollbar(f: &mut Frame, area: Rect, scroll: usize, total: usize, visibl
 fn render_file_header(state: &AppState, fi: usize, width: usize) -> Line<'static> {
     let f = &state.files[fi];
     let expanded = state.expanded.get(fi).copied().unwrap_or(true);
-    let viewed = state.viewed.contains(&f.path);
+    let viewed = state.viewed.contains_key(&f.path);
     let chevron = if expanded { '▾' } else { '▸' };
 
     let (badge, badge_style) = match f.status {
