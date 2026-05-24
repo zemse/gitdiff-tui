@@ -1,4 +1,4 @@
-use crate::app::{self, AppState, FlatKind, IntraRange, LineKey, Mode};
+use crate::app::{self, AppState, ComposerTarget, FlatKind, IntraRange, LineKey, Mode};
 use crate::diff::{FileStatus, LineKind};
 use crate::syntax::Span as HSpan;
 use ratatui::Frame;
@@ -394,13 +394,12 @@ fn draw_footer(f: &mut Frame, area: Rect, state: &AppState) {
         Mode::Normal => {
             "j/k · ]/[ file · }/{ hunk · e tree · t pick · R drafts · v viewed · y yank · c comment · S submit · ? help · q quit"
         }
-        Mode::Composing => {
-            if state.editing_draft_idx.is_some() {
+        Mode::Composing => match state.composer_target {
+            Some(ComposerTarget::EditDraft(_)) => {
                 "enter save · shift-enter newline · ctrl-d delete · esc cancel"
-            } else {
-                "enter save · shift-enter newline · esc cancel"
             }
-        }
+            _ => "enter save · shift-enter newline · esc cancel",
+        },
         Mode::Help => "any key to close help",
         Mode::Picker => "type to filter · ↑↓ select · enter jump · esc cancel",
     };
@@ -1434,13 +1433,14 @@ fn build_composer_title(state: &AppState) -> String {
     } else {
         format!("L{start}")
     };
-    let delete_hint = if state.editing_draft_idx.is_some() {
-        " · ctrl-d delete"
-    } else {
-        ""
+    let (verb, delete_hint) = match state.composer_target {
+        Some(ComposerTarget::EditDraft(_)) => ("Edit comment", " · ctrl-d delete"),
+        Some(ComposerTarget::EditReply { .. }) => ("Edit reply", ""),
+        Some(ComposerTarget::NewReply(_)) => ("Reply to thread", ""),
+        _ => ("Comment", ""),
     };
     format!(
-        " Comment on {}:{}  · enter save · shift-enter newline{} · esc cancel ",
+        " {verb} on {}:{}  · enter save · shift-enter newline{} · esc cancel ",
         file.path, anchor, delete_hint
     )
 }

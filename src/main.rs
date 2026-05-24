@@ -7,7 +7,7 @@ mod syntax;
 mod ui;
 
 use anyhow::Result;
-use app::{AppState, FlatKind, FuzzyPicker, Mode};
+use app::{AppState, ComposerTarget, FlatKind, FuzzyPicker, Mode};
 use crossterm::event::{
     self, DisableMouseCapture, EnableMouseCapture, Event, KeyCode, KeyEventKind, KeyModifiers,
     MouseButton, MouseEvent, MouseEventKind,
@@ -825,11 +825,13 @@ fn edit_draft(
 }
 
 fn open_composer(state: &mut AppState, composer: &mut Option<TextArea<'static>>) {
-    let existing = state.existing_draft_body_for_selection();
-    let edit_idx = state.draft_for_selection();
+    let target = state.decide_composer_target();
+    let body = state.initial_composer_body(target);
     let mut ta = TextArea::default();
-    let initial_lines = if let Some(b) = existing {
-        let lines: Vec<String> = b.lines().map(|s| s.to_string()).collect();
+    let initial_lines = if body.is_empty() {
+        1
+    } else {
+        let lines: Vec<String> = body.lines().map(|s| s.to_string()).collect();
         for (i, line) in lines.iter().enumerate() {
             ta.insert_str(line);
             if i + 1 < lines.len() {
@@ -837,14 +839,13 @@ fn open_composer(state: &mut AppState, composer: &mut Option<TextArea<'static>>)
             }
         }
         lines.len().max(1)
-    } else {
-        1
     };
     *composer = Some(ta);
     state.mode = Mode::Composing;
-    // Hide the draft being edited so the composer replaces (not duplicates) it.
-    if edit_idx.is_some() {
-        state.editing_draft_idx = edit_idx;
+    state.composer_target = Some(target);
+    state.editing_draft_idx = target.hides_draft();
+    if state.editing_draft_idx.is_some() {
+        // Hide the draft being edited/replied to so the composer takes its slot.
         state.rebuild_flat();
     }
     // Seed composer_height with the body's natural size so the gap computed on
@@ -872,6 +873,7 @@ fn close_composer(state: &mut AppState, composer: &mut Option<TextArea<'static>>
     state.mode = Mode::Normal;
     state.composer_height = 0;
     state.editing_draft_idx = None;
+    state.composer_target = None;
     state.clear_selection();
     state.cursor_visible = false;
     // Always rebuild so a newly-saved (or just-edited) draft renders on the
@@ -906,20 +908,38 @@ fn handle_composing(state: &mut AppState, ev: &Event, composer: &mut Option<Text
                 .unwrap_or_default()
                 .trim()
                 .to_string();
+            let target = state
+                .composer_target
+                .unwrap_or(ComposerTarget::NewDraft);
             if body.is_empty() {
                 state.status = Some("empty comment, cancelled".into());
-            } else if state.add_draft_from_selection(body).is_some() {
-                state.status = Some("draft saved (press S to submit to REVIEW.md)".into());
+            } else if state.save_composer(target, body) {
+                let msg = match target {
+                    ComposerTarget::NewDraft => "draft saved",
+                    ComposerTarget::EditDraft(_) => "comment edited",
+                    ComposerTarget::EditReply { .. } => "reply edited",
+                    ComposerTarget::NewReply(_) => "reply added",
+                };
+                state.status = Some(format!("{msg} (press S to submit)"));
             }
             close_composer(state, composer);
         }
         KeyCode::Char('d') if ctrl => {
-            if let Some(idx) = state.editing_draft_idx {
-                state.drafts.remove(idx);
-                close_composer(state, composer);
-                state.status = Some("draft deleted".into());
-            } else {
-                state.status = Some("nothing to delete (new comment)".into());
+            // ctrl-d only deletes when editing the original draft. Reply
+            // edits/new-reply paths leave it as a no-op to avoid accidentally
+            // nuking a thread someone replied to.
+            match state.composer_target {
+                Some(ComposerTarget::EditDraft(idx)) => {
+                    state.drafts.remove(idx);
+                    close_composer(state, composer);
+                    state.status = Some("draft deleted".into());
+                }
+                Some(ComposerTarget::EditReply { .. } | ComposerTarget::NewReply(_)) => {
+                    state.status = Some("ctrl-d disabled inside a thread".into());
+                }
+                _ => {
+                    state.status = Some("nothing to delete (new comment)".into());
+                }
             }
         }
         _ => {

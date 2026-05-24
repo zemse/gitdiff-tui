@@ -101,8 +101,9 @@ For each open comment:
      needed), add a single line `<!-- resolved -->` inside the same replies
      block. gitdiff hides resolved threads from its TUI on the next launch.
 
-Choose any `your-handle` (e.g. claude-code, codex, gemini). Use ISO-8601 UTC
-timestamps.
+Choose any `your-handle` EXCEPT `you` (that handle is reserved for the human
+running gitdiff — typical agent handles are claude-code, codex, gemini). Use
+ISO-8601 UTC timestamps.
 
 EVERYTHING OUTSIDE THE `<!-- replies:* -->` BLOCKS IS OVERWRITTEN on the
 human's next submit. Do not edit there — your changes will be lost. Replies

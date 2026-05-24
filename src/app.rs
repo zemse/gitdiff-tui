@@ -71,6 +71,39 @@ pub struct Reply {
 
 pub const REACTION_CYCLE: &[&str] = &["👍", "👎", "🎉", "😄", "❤️", "🚀", "👀", "❓"];
 
+/// Author handle written into REVIEW-*.md for messages sent from this TUI.
+/// Agents are instructed not to claim this name when replying.
+pub const LOCAL_AUTHOR: &str = "you";
+
+/// What the composer is operating on. The thread editing rules are:
+///   * Your message is mutable only if nothing follows it in the thread.
+///   * If the last message in the thread isn't yours, the composer starts a
+///     new reply instead of editing.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ComposerTarget {
+    /// Brand-new comment on the current selection — no draft exists yet.
+    NewDraft,
+    /// Editing the original comment body (only when no replies exist yet).
+    EditDraft(usize),
+    /// Editing your own last reply.
+    EditReply { draft_idx: usize, reply_idx: usize },
+    /// Appending a fresh reply because the thread's last message isn't yours.
+    NewReply(usize),
+}
+
+impl ComposerTarget {
+    /// Which draft (if any) should hide while the composer is open. The draft
+    /// being edited/replied to is hidden so the composer takes its slot.
+    pub fn hides_draft(&self) -> Option<usize> {
+        match self {
+            ComposerTarget::EditDraft(idx)
+            | ComposerTarget::EditReply { draft_idx: idx, .. }
+            | ComposerTarget::NewReply(idx) => Some(*idx),
+            ComposerTarget::NewDraft => None,
+        }
+    }
+}
+
 impl Draft {
     pub fn anchor_label(&self) -> String {
         let a = self.new_lineno.or(self.old_lineno);
@@ -196,8 +229,12 @@ pub struct AppState {
     pub composer_height: u16,
     // Index of the draft currently being edited in the composer. When Some,
     // rebuild_flat hides that draft's rows so the composer replaces (not
-    // duplicates) the rendered comment.
+    // duplicates) the rendered comment. Derived from `composer_target` each
+    // time the composer opens; cleared on close.
     pub editing_draft_idx: Option<usize>,
+    // What the open composer is targeting (new draft, edit, reply). Set in
+    // `open_composer`, consulted by the save path and the composer chrome.
+    pub composer_target: Option<ComposerTarget>,
     // Geometry of the composer popup as drawn last frame (x, y, w, h). Used to
     // map mouse coordinates into the embedded TextArea for drag-select.
     pub composer_rect: Option<(u16, u16, u16, u16)>,
@@ -265,6 +302,7 @@ impl AppState {
             body_width: 80,
             composer_height: 0,
             editing_draft_idx: None,
+            composer_target: None,
             composer_rect: None,
             selection_menu_rect: None,
             flat_for_body_width: 0,
@@ -980,23 +1018,6 @@ impl AppState {
         Some(out)
     }
 
-    pub fn existing_draft_body_for_selection(&self) -> Option<String> {
-        let keys = self.selection_lines();
-        // Anchor at the *last* selected line — that's where the composer and
-        // the saved draft are rendered.
-        let (fi, hi, li) = *keys.last()?;
-        let file = self.files.get(fi)?;
-        let line = file.hunks.get(hi)?.lines.get(li)?;
-        self.drafts
-            .iter()
-            .find(|d| {
-                d.file_path == file.path
-                    && d.new_lineno == line.new_lineno
-                    && d.old_lineno == line.old_lineno
-            })
-            .map(|d| d.body.clone())
-    }
-
     pub fn draft_for_selection(&self) -> Option<usize> {
         let keys = self.selection_lines();
         let (fi, hi, li) = *keys.last()?;
@@ -1055,6 +1076,97 @@ impl AppState {
                 && d.new_lineno == line.new_lineno
                 && d.old_lineno == line.old_lineno
         })
+    }
+
+    /// Picks the composer target for the current selection. The thread
+    /// editing rules: you can only edit a message if it's yours and nothing
+    /// follows it; otherwise the composer is a brand-new message.
+    pub fn decide_composer_target(&self) -> ComposerTarget {
+        let Some(idx) = self.draft_for_selection() else {
+            return ComposerTarget::NewDraft;
+        };
+        let d = &self.drafts[idx];
+        if d.replies.is_empty() {
+            // The original comment is still the thread's last message. You wrote
+            // it, so you can edit it.
+            ComposerTarget::EditDraft(idx)
+        } else {
+            let last = d.replies.len() - 1;
+            if d.replies[last].author == LOCAL_AUTHOR {
+                ComposerTarget::EditReply {
+                    draft_idx: idx,
+                    reply_idx: last,
+                }
+            } else {
+                ComposerTarget::NewReply(idx)
+            }
+        }
+    }
+
+    /// Initial composer text for `target` — the existing body for edits, or
+    /// empty for new messages.
+    pub fn initial_composer_body(&self, target: ComposerTarget) -> String {
+        match target {
+            ComposerTarget::NewDraft | ComposerTarget::NewReply(_) => String::new(),
+            ComposerTarget::EditDraft(idx) => self
+                .drafts
+                .get(idx)
+                .map(|d| d.body.clone())
+                .unwrap_or_default(),
+            ComposerTarget::EditReply {
+                draft_idx,
+                reply_idx,
+            } => self
+                .drafts
+                .get(draft_idx)
+                .and_then(|d| d.replies.get(reply_idx))
+                .map(|r| r.body.clone())
+                .unwrap_or_default(),
+        }
+    }
+
+    /// Commits `body` to whatever the open composer is targeting.
+    pub fn save_composer(&mut self, target: ComposerTarget, body: String) -> bool {
+        match target {
+            ComposerTarget::NewDraft => self.add_draft_from_selection(body).is_some(),
+            ComposerTarget::EditDraft(idx) => {
+                if let Some(d) = self.drafts.get_mut(idx) {
+                    d.body = body;
+                    d.created_at = Utc::now();
+                    true
+                } else {
+                    false
+                }
+            }
+            ComposerTarget::EditReply {
+                draft_idx,
+                reply_idx,
+            } => {
+                if let Some(r) = self
+                    .drafts
+                    .get_mut(draft_idx)
+                    .and_then(|d| d.replies.get_mut(reply_idx))
+                {
+                    r.body = body;
+                    r.created_at = Utc::now();
+                    true
+                } else {
+                    false
+                }
+            }
+            ComposerTarget::NewReply(idx) => {
+                if let Some(d) = self.drafts.get_mut(idx) {
+                    d.replies.push(Reply {
+                        author: LOCAL_AUTHOR.to_string(),
+                        body,
+                        created_at: Utc::now(),
+                    });
+                    true
+                } else {
+                    false
+                }
+            }
+        }
     }
 
     pub fn add_draft_from_selection(&mut self, body: String) -> Option<()> {
