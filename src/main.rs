@@ -727,6 +727,15 @@ fn handle_composing(state: &mut AppState, ev: &Event, composer: &mut Option<Text
             }
             close_composer(state, composer);
         }
+        KeyCode::Char('d') if ctrl => {
+            if let Some(idx) = state.editing_draft_idx {
+                state.drafts.remove(idx);
+                close_composer(state, composer);
+                state.status = Some("draft deleted".into());
+            } else {
+                state.status = Some("nothing to delete (new comment)".into());
+            }
+        }
         _ => {
             if let Some(ta) = composer {
                 ta.input(*key);

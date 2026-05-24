@@ -357,7 +357,13 @@ fn draw_footer(f: &mut Frame, area: Rect, state: &AppState) {
         Mode::Normal => {
             "j/k · ]/[ file · }/{ hunk · e tree · t pick · R drafts · v viewed · y yank · c comment · S submit · ? help · q quit"
         }
-        Mode::Composing => "ctrl-s save draft · esc cancel",
+        Mode::Composing => {
+            if state.editing_draft_idx.is_some() {
+                "ctrl-s save draft · ctrl-d delete · esc cancel"
+            } else {
+                "ctrl-s save draft · esc cancel"
+            }
+        }
         Mode::Help => "any key to close help",
         Mode::Picker => "type to filter · ↑↓ select · enter jump · esc cancel",
     };
@@ -1015,7 +1021,15 @@ fn build_composer_title(state: &AppState) -> String {
     } else {
         format!("L{start}")
     };
-    format!(" Comment on {}:{}  · ctrl-s save · esc cancel ", file.path, anchor)
+    let delete_hint = if state.editing_draft_idx.is_some() {
+        " · ctrl-d delete"
+    } else {
+        ""
+    };
+    format!(
+        " Comment on {}:{}  · ctrl-s save{} · esc cancel ",
+        file.path, anchor, delete_hint
+    )
 }
 
 fn draw_help(f: &mut Frame, area: Rect) {
@@ -1062,6 +1076,7 @@ fn draw_help(f: &mut Frame, area: Rect) {
         Line::from(""),
         Line::from("  c            add / edit comment on current line"),
         Line::from("  x            delete comment on current line"),
+        Line::from("  ctrl-d       delete comment from edit mode (in composer)"),
         Line::from("  S            submit drafts → REVIEW.md at repo root"),
         Line::from(""),
         Line::from("  mouse        click to move cursor, click header to collapse, wheel to scroll"),
