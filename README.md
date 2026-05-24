@@ -4,7 +4,7 @@ A Rust + ratatui TUI for reviewing local git changes like a GitHub PR — withou
 pushing or opening a PR. Comments are written to a `REVIEW.md` at the repo root,
 in a format a coding agent (or another human) can act on directly.
 
-![gitdiff TUI](https://raw.githubusercontent.com/zemse/gitdiff-tui/main/screenshot.png)
+![gitdiff TUI — comment thread with an agent reply](https://raw.githubusercontent.com/zemse/gitdiff-tui/main/screenshot.png)
 
 ## Features
 
