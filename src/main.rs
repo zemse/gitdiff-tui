@@ -77,15 +77,25 @@ fn main() -> Result<()> {
             }
         }
     }
-    // One-shot dedup of accumulated reply duplicates. Pre-fix builds wrote
-    // REVIEW.md with second-precision timestamps; on relaunch the merger
-    // compared the parsed reply (seconds) against the in-memory one
-    // (microseconds), found them unequal and appended a copy. Collapse those
-    // by `(author, body, timestamp-truncated-to-seconds)` and keep the first
-    // (usually the highest-precision) occurrence.
+    // Cleanup pass for the duplicate-reply drift produced by older builds.
+    // Two passes per draft:
+    //   1. Collapse synthetic 'X\nX\n…' bodies. The old parser merged
+    //      consecutive '> [@a T] X' lines (same author+ts) into one
+    //      multi-line Reply body, and a duplicated line therefore became
+    //      'X\nX'. Only collapse when *every* line is identical so real
+    //      multi-line replies stay intact.
+    //   2. Dedup by (author, body, timestamp-truncated-to-seconds), keeping
+    //      the first (most-precise) occurrence. This catches the
+    //      microsecond-vs-second-precision drift from the old write_review.
     let mut deduped_any = false;
     for d in drafts.iter_mut() {
         let before = d.replies.len();
+        for r in d.replies.iter_mut() {
+            let lines: Vec<&str> = r.body.split('\n').collect();
+            if lines.len() > 1 && lines.iter().all(|l| *l == lines[0]) {
+                r.body = lines[0].to_string();
+            }
+        }
         let mut seen: std::collections::HashSet<(String, String, i64)> =
             std::collections::HashSet::new();
         d.replies
