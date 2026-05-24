@@ -69,27 +69,30 @@ pub fn save_drafts(root: &Path, source: &DiffSource, drafts: &[Draft]) -> Result
 }
 
 const AGENT_INSTRUCTIONS: &str = "<!--
-gitdiff REVIEW file — agent instructions
-=========================================
-This file is regenerated from .gitdiff/drafts-*.json each time the human runs
-`S` in the TUI. Everything outside `<!-- replies:tID -->` ... `<!-- /replies:tID -->`
-blocks is OVERWRITTEN on the next submit, so do not put your output anywhere
-else — it will be lost.
+INSTRUCTIONS FOR CODING AGENTS (claude-code, codex, gemini, etc.)
+=================================================================
 
-To reply to a comment thread:
-  1. Find the `### Lxx · ... · thread:tID` heading you want to reply to.
-  2. Locate the matching `<!-- replies:tID -->` ... `<!-- /replies:tID -->`
-     block directly below the human's comment body.
-  3. Append a line of the form:
-         > [@your-handle YYYY-MM-DDTHH:MM:SSZ] your reply body, one line.
-     For multi-line replies, use multiple `> [@your-handle ts] ...` lines.
-  4. Pick any `your-handle` (e.g. `claude-code`, `codex`, `gpt-5`, `gemini`).
-     Use ISO-8601 UTC for the timestamp.
-  5. Save the file. On the next `gitdiff` launch your reply is parsed back into
-     the JSON store and rendered inline in the TUI thread.
+You are reading a gitdiff review file. A human wrote the comments under each
+`### Lxx ... · thread:tID` heading; your job is to address them.
 
-Existing replies are preserved across submits. Do not edit text outside the
-replies blocks — your changes will be lost.
+For each open comment:
+  1. Read the comment body and the `Original` diff snippet under the heading.
+  2. Make the requested code change in the actual source file, OR write a
+     reply explaining why you did not.
+  3. Append your reply inside the matching `<!-- replies:tID --> ... <!--
+     /replies:tID -->` block, one line per reply line:
+         > [@your-handle 2026-05-24T17:05:00Z] your reply text, one line.
+     Multi-line reply? Emit several lines with the same author+timestamp.
+  4. When the thread is fully addressed (code change shipped or no action
+     needed), add a single line `<!-- resolved -->` inside the same replies
+     block. gitdiff hides resolved threads from its TUI on the next launch.
+
+Choose any `your-handle` (e.g. claude-code, codex, gemini). Use ISO-8601 UTC
+timestamps.
+
+EVERYTHING OUTSIDE THE `<!-- replies:* -->` BLOCKS IS OVERWRITTEN on the
+human's next submit. Do not edit there — your changes will be lost. Replies
+and the `<!-- resolved -->` marker are preserved across submits.
 -->\n\n";
 
 pub fn write_review(
@@ -183,16 +186,16 @@ fn write_section<'a>(out: &mut String, _label: &str, ds: impl Iterator<Item = &'
             out.push_str(&format!("\n<!-- replies:{tid} -->\n"));
             for r in &d.replies {
                 let ts = r.created_at.format("%Y-%m-%dT%H:%M:%SZ");
-                for (i, ln) in r.body.lines().enumerate() {
-                    if i == 0 {
-                        out.push_str(&format!("> [@{} {}] {}\n", r.author, ts, ln));
-                    } else {
+                if r.body.is_empty() {
+                    out.push_str(&format!("> [@{} {}]\n", r.author, ts));
+                } else {
+                    for ln in r.body.lines() {
                         out.push_str(&format!("> [@{} {}] {}\n", r.author, ts, ln));
                     }
                 }
-                if r.body.is_empty() {
-                    out.push_str(&format!("> [@{} {}]\n", r.author, ts));
-                }
+            }
+            if d.resolved {
+                out.push_str("<!-- resolved -->\n");
             }
             out.push_str(&format!("<!-- /replies:{tid} -->\n"));
             out.push_str("\n---\n\n");
@@ -200,12 +203,20 @@ fn write_section<'a>(out: &mut String, _label: &str, ds: impl Iterator<Item = &'
     }
 }
 
+/// Per-thread payload imported back from a REVIEW-*.md `<!-- replies:tID -->`
+/// block.
+#[derive(Debug, Default, Clone)]
+pub struct ThreadImport {
+    pub replies: Vec<Reply>,
+    /// True when the agent placed a `<!-- resolved -->` marker inside the block.
+    pub resolved: bool,
+}
+
 /// Scans a REVIEW-*.md file and extracts all `<!-- replies:tID --> ... <!-- /replies:tID -->`
-/// blocks, parsing the `> [@author timestamp] body` lines inside. Returns a
-/// thread_id → Vec<Reply> map for merging back into the JSON draft store on
-/// launch.
-pub fn parse_review_replies(text: &str) -> HashMap<String, Vec<Reply>> {
-    let mut out: HashMap<String, Vec<Reply>> = HashMap::new();
+/// blocks. Returns a thread_id → import map for merging back into the JSON
+/// draft store on launch.
+pub fn parse_review_replies(text: &str) -> HashMap<String, ThreadImport> {
+    let mut out: HashMap<String, ThreadImport> = HashMap::new();
     let mut cursor = 0;
     while let Some(start) = text[cursor..].find("<!-- replies:") {
         let abs_start = cursor + start;
@@ -221,9 +232,19 @@ pub fn parse_review_replies(text: &str) -> HashMap<String, Vec<Reply>> {
         let body_end = body_start + rel_end;
         let block = &text[body_start..body_end];
         let mut replies = Vec::new();
+        let mut resolved = false;
         let mut current: Option<Reply> = None;
         for raw in block.lines() {
             let line = raw.trim_end();
+            // Resolve marker. Accept variants for forgiving parsing.
+            let trimmed = line.trim();
+            if trimmed == "<!-- resolved -->"
+                || trimmed == "<!--resolved-->"
+                || trimmed.eq_ignore_ascii_case("<!-- resolved -->")
+            {
+                resolved = true;
+                continue;
+            }
             if !line.starts_with("> [@") {
                 if line.trim().is_empty() {
                     if let Some(r) = current.take() {
@@ -261,8 +282,10 @@ pub fn parse_review_replies(text: &str) -> HashMap<String, Vec<Reply>> {
         if let Some(r) = current.take() {
             replies.push(r);
         }
-        if !replies.is_empty() {
-            out.entry(tid).or_default().extend(replies);
+        if !replies.is_empty() || resolved {
+            let entry = out.entry(tid).or_default();
+            entry.replies.extend(replies);
+            entry.resolved = entry.resolved || resolved;
         }
         cursor = body_end + end_marker.len();
     }

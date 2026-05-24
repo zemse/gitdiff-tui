@@ -375,6 +375,12 @@ impl AppState {
                             if self.editing_draft_idx == Some(di) {
                                 continue;
                             }
+                            // Resolved threads are hidden from the inline TUI;
+                            // they still show in the side drafts pane and in
+                            // REVIEW-*.md's Resolved section.
+                            if self.drafts[di].resolved {
+                                continue;
+                            }
                             let max_w = draft_text_width(self.body_width);
                             let body_lines = wrap_body(&self.drafts[di].body, max_w)
                                 .len()
@@ -1009,6 +1015,11 @@ impl AppState {
         let path = &self.files.get(fi)?.path;
         self.drafts.iter().enumerate().find_map(|(idx, d)| {
             if &d.file_path != path {
+                return None;
+            }
+            // Hidden from inline rendering when resolved — matches rebuild_flat
+            // (no DraftRow emitted), so the framing/marker must also be off.
+            if d.resolved {
                 return None;
             }
             if d.old_lineno == line.old_lineno && d.new_lineno == line.new_lineno {

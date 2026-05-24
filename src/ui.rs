@@ -396,9 +396,9 @@ fn draw_footer(f: &mut Frame, area: Rect, state: &AppState) {
         }
         Mode::Composing => {
             if state.editing_draft_idx.is_some() {
-                "ctrl-s save draft · ctrl-d delete · esc cancel"
+                "enter save · shift-enter newline · ctrl-d delete · esc cancel"
             } else {
-                "ctrl-s save draft · esc cancel"
+                "enter save · shift-enter newline · esc cancel"
             }
         }
         Mode::Help => "any key to close help",
@@ -1440,7 +1440,7 @@ fn build_composer_title(state: &AppState) -> String {
         ""
     };
     format!(
-        " Comment on {}:{}  · ctrl-s save{} · esc cancel ",
+        " Comment on {}:{}  · enter save · shift-enter newline{} · esc cancel ",
         file.path, anchor, delete_hint
     )
 }
@@ -1488,6 +1488,8 @@ fn draw_help(f: &mut Frame, area: Rect) {
         Line::from("  V            cycle review verdict (comment / approve / request changes)"),
         Line::from(""),
         Line::from("  c            add / edit comment on current line"),
+        Line::from("  enter        save comment (composer)"),
+        Line::from("  shift-enter  insert newline (composer)"),
         Line::from("  x            delete comment on current line"),
         Line::from("  ctrl-d       delete comment from edit mode (in composer)"),
         Line::from("  S            submit drafts → REVIEW.md at repo root"),

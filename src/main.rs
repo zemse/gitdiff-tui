@@ -56,10 +56,9 @@ fn main() -> Result<()> {
         if let Ok(text) = std::fs::read_to_string(&review_p) {
             let map = review::parse_review_replies(&text);
             for d in drafts.iter_mut() {
-                if let Some(new_replies) = map.get(&d.thread_id) {
-                    // Append only replies we haven't already stored (dedupe by
-                    // (author, created_at, body)).
-                    for r in new_replies {
+                if let Some(import) = map.get(&d.thread_id) {
+                    // Dedupe by (author, created_at, body); append the rest.
+                    for r in &import.replies {
                         let dup = d.replies.iter().any(|x| {
                             x.author == r.author
                                 && x.created_at == r.created_at
@@ -69,6 +68,10 @@ fn main() -> Result<()> {
                             d.replies.push(r.clone());
                             merged_any = true;
                         }
+                    }
+                    if import.resolved && !d.resolved {
+                        d.resolved = true;
+                        merged_any = true;
                     }
                 }
             }
@@ -872,13 +875,21 @@ fn handle_composing(state: &mut AppState, ev: &Event, composer: &mut Option<Text
         return;
     }
     let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
+    let shift = key.modifiers.contains(KeyModifiers::SHIFT);
+    let alt = key.modifiers.contains(KeyModifiers::ALT);
+
+    // Save shortcut: plain Enter (or ctrl-s as legacy alias). Shift/Alt+Enter
+    // and ctrl+Enter all insert a literal newline so multi-line comments stay
+    // possible.
+    let save_now = matches!(key.code, KeyCode::Enter) && !shift && !alt && !ctrl
+        || matches!(key.code, KeyCode::Char('s')) && ctrl;
 
     match key.code {
         KeyCode::Esc => {
             close_composer(state, composer);
             state.status = Some("comment cancelled".into());
         }
-        KeyCode::Char('s') if ctrl => {
+        _ if save_now => {
             let body = composer
                 .as_ref()
                 .map(|t| t.lines().join("\n"))
