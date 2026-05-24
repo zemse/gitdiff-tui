@@ -56,10 +56,13 @@ pub const REACTION_CYCLE: &[&str] = &["👍", "👎", "🎉", "😄", "❤️", 
 
 impl Draft {
     pub fn anchor_label(&self) -> String {
-        let start = self.new_lineno.or(self.old_lineno);
-        let end = self.new_lineno_end.or(self.old_lineno_end);
-        match (start, end) {
-            (Some(s), Some(e)) if e > s => format!("L{s}-{e}"),
+        let a = self.new_lineno.or(self.old_lineno);
+        let b = self.new_lineno_end.or(self.old_lineno_end);
+        match (a, b) {
+            (Some(a), Some(b)) if a != b => {
+                let (lo, hi) = if a < b { (a, b) } else { (b, a) };
+                format!("L{lo}-{hi}")
+            }
             (Some(s), _) => {
                 if self.new_lineno.is_none() {
                     format!("L{s} (pre-change)")
@@ -945,7 +948,9 @@ impl AppState {
 
     pub fn existing_draft_body_for_selection(&self) -> Option<String> {
         let keys = self.selection_lines();
-        let (fi, hi, li) = *keys.first()?;
+        // Anchor at the *last* selected line — that's where the composer and
+        // the saved draft are rendered.
+        let (fi, hi, li) = *keys.last()?;
         let file = self.files.get(fi)?;
         let line = file.hunks.get(hi)?.lines.get(li)?;
         self.drafts
@@ -960,7 +965,7 @@ impl AppState {
 
     pub fn draft_for_selection(&self) -> Option<usize> {
         let keys = self.selection_lines();
-        let (fi, hi, li) = *keys.first()?;
+        let (fi, hi, li) = *keys.last()?;
         let file = self.files.get(fi)?;
         let line = file.hunks.get(hi)?.lines.get(li)?;
         self.drafts.iter().position(|d| {
@@ -971,9 +976,10 @@ impl AppState {
     }
 
     /// Returns `(draft_idx, is_anchor)` if `line` falls inside a draft's range.
-    /// `is_anchor` is true for the row the draft renders on (its start line); a
-    /// multi-line draft also covers the intermediate/end rows so the UI can
-    /// frame the whole range, not just the anchor.
+    /// `is_anchor` is true for the row the draft renders on; the anchor is the
+    /// *last* line of the original selection. The two stored linenos can
+    /// appear in either order across older drafts, so we treat the pair as an
+    /// unordered min/max range when checking inclusion.
     pub fn draft_covering_line(&self, fi: usize, line: &DiffLine) -> Option<(usize, bool)> {
         let path = &self.files.get(fi)?.path;
         self.drafts.iter().enumerate().find_map(|(idx, d)| {
@@ -983,17 +989,19 @@ impl AppState {
             if d.old_lineno == line.old_lineno && d.new_lineno == line.new_lineno {
                 return Some((idx, true));
             }
-            // Multi-line: include rows past the anchor up to the recorded end.
-            // Strict `>` skips the anchor (already matched above).
-            if let (Some(s), Some(e), Some(ln)) = (d.new_lineno, d.new_lineno_end, line.new_lineno)
+            if let (Some(a), Some(b), Some(ln)) =
+                (d.new_lineno, d.new_lineno_end, line.new_lineno)
             {
-                if ln > s && ln <= e {
+                let (lo, hi) = if a <= b { (a, b) } else { (b, a) };
+                if ln >= lo && ln <= hi {
                     return Some((idx, false));
                 }
             }
-            if let (Some(s), Some(e), Some(ln)) = (d.old_lineno, d.old_lineno_end, line.old_lineno)
+            if let (Some(a), Some(b), Some(ln)) =
+                (d.old_lineno, d.old_lineno_end, line.old_lineno)
             {
-                if ln > s && ln <= e {
+                let (lo, hi) = if a <= b { (a, b) } else { (b, a) };
+                if ln >= lo && ln <= hi {
                     return Some((idx, false));
                 }
             }
@@ -1028,40 +1036,44 @@ impl AppState {
         let last_line = file.hunks.get(last_key.1)?.lines.get(last_key.2)?.clone();
 
         let snippet = build_range_snippet(&file, &keys);
-        let kind = match first_line.kind {
+        // Use the last selected line's kind for the visual sigil — that's the
+        // line the box now anchors to.
+        let kind = match last_line.kind {
             LineKind::Added => "added",
             LineKind::Deleted => "deleted",
             LineKind::Context => "context",
         };
-        let end_old = if keys.len() > 1 {
-            last_line.old_lineno
+        // Anchor on the *last* selected line; store the other end of the range
+        // in `_end` (it may be numerically less than the anchor).
+        let other_old = if keys.len() > 1 {
+            first_line.old_lineno
         } else {
             None
         };
-        let end_new = if keys.len() > 1 {
-            last_line.new_lineno
+        let other_new = if keys.len() > 1 {
+            first_line.new_lineno
         } else {
             None
         };
 
         if let Some(idx) = self.drafts.iter().position(|d| {
             d.file_path == file.path
-                && d.new_lineno == first_line.new_lineno
-                && d.old_lineno == first_line.old_lineno
+                && d.new_lineno == last_line.new_lineno
+                && d.old_lineno == last_line.old_lineno
         }) {
             self.drafts[idx].body = body;
             self.drafts[idx].created_at = Utc::now();
-            self.drafts[idx].old_lineno_end = end_old;
-            self.drafts[idx].new_lineno_end = end_new;
+            self.drafts[idx].old_lineno_end = other_old;
+            self.drafts[idx].new_lineno_end = other_new;
             self.drafts[idx].diff_snippet = snippet;
             return Some(());
         }
         self.drafts.push(Draft {
             file_path: file.path.clone(),
-            old_lineno: first_line.old_lineno,
-            new_lineno: first_line.new_lineno,
-            old_lineno_end: end_old,
-            new_lineno_end: end_new,
+            old_lineno: last_line.old_lineno,
+            new_lineno: last_line.new_lineno,
+            old_lineno_end: other_old,
+            new_lineno_end: other_new,
             line_kind: kind.to_string(),
             diff_snippet: snippet,
             body,
