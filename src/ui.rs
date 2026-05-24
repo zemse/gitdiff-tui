@@ -474,15 +474,20 @@ fn draw_body(f: &mut Frame, area: Rect, state: &AppState) {
 
 /// Returns (extended_position, height) of the composer-induced gap.
 /// `(0, 0)` when the composer is not open.
+///
+/// The gap is placed right after the *first* selected line so the popup sits
+/// where the saved draft will render (drafts anchor at the start of the range,
+/// see `app::AppState::add_draft_from_selection`). Anchoring at the end would
+/// make the draft visually jump on save.
 fn composer_gap(state: &AppState) -> (usize, usize) {
     if state.mode != Mode::Composing {
         return (0, 0);
     }
-    let end = state
+    let anchor = state
         .selection
-        .map(|s| s.range().1)
+        .map(|s| s.range().0)
         .unwrap_or(state.cursor);
-    (end + 1, state.composer_height.max(COMPOSER_MIN_H) as usize)
+    (anchor + 1, state.composer_height.max(COMPOSER_MIN_H) as usize)
 }
 
 fn draw_scrollbar(f: &mut Frame, area: Rect, scroll: usize, total: usize, visible_h: usize) {

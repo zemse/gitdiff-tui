@@ -675,12 +675,12 @@ fn open_composer(state: &mut AppState, composer: &mut Option<TextArea<'static>>)
         .saturating_add(2)
         .max(ui::COMPOSER_MIN_H);
     state.composer_height = h;
-    // Scroll so both the selection and the inserted composer-gap fit in view.
-    // Gap occupies rows [end+1, end+1+H) in extended coords.
+    // Scroll so the selection start and the inserted composer-gap fit in view.
+    // Gap occupies rows [a+1, a+1+H) in extended coords (see ui::composer_gap).
     if let Some(sel) = state.selection {
-        let (a, b) = sel.range();
+        let (a, _b) = sel.range();
         let composer_h = state.composer_height as usize;
-        let needed_scroll_floor = (b + 1 + composer_h).saturating_sub(state.viewport_height);
+        let needed_scroll_floor = (a + 1 + composer_h).saturating_sub(state.viewport_height);
         // keep selection start visible at the top
         let target = needed_scroll_floor.min(a);
         if state.scroll < target {
