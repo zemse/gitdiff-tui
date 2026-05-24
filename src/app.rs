@@ -75,6 +75,19 @@ pub const REACTION_CYCLE: &[&str] = &["👍", "👎", "🎉", "😄", "❤️", 
 /// Agents are instructed not to claim this name when replying.
 pub const LOCAL_AUTHOR: &str = "you";
 
+/// A thread "needs your attention" when it's still open and the last message
+/// in the conversation isn't yours — i.e. an agent (or someone else) replied
+/// and you haven't responded.
+pub fn needs_attention(d: &Draft) -> bool {
+    if d.resolved {
+        return false;
+    }
+    d.replies
+        .last()
+        .map(|r| r.author != LOCAL_AUTHOR)
+        .unwrap_or(false)
+}
+
 /// What the composer is operating on. The thread editing rules are:
 ///   * Your message is mutable only if nothing follows it in the thread.
 ///   * If the last message in the thread isn't yours, the composer starts a
@@ -916,6 +929,39 @@ impl AppState {
             self.cursor = start + i;
             self.ensure_cursor_visible();
         }
+    }
+
+    /// Jumps the cursor to the next thread whose latest message isn't yours,
+    /// wrapping to the top if there is none after the cursor. Returns whether
+    /// it actually moved.
+    pub fn jump_next_thread_needing_attention(&mut self) -> bool {
+        // Build the list of flat indices that hold a draft anchor needing
+        // attention, in document order. Then find the first one strictly
+        // after the cursor; wrap to the first overall if none.
+        let mut anchors: Vec<usize> = Vec::new();
+        for (i, fl) in self.flat.iter().enumerate() {
+            if fl.kind != FlatKind::DraftRow || fl.line_idx != Some(0) {
+                continue;
+            }
+            let Some(di) = fl.draft_idx else { continue };
+            if let Some(d) = self.drafts.get(di) {
+                if needs_attention(d) {
+                    anchors.push(i);
+                }
+            }
+        }
+        if anchors.is_empty() {
+            return false;
+        }
+        let target = anchors
+            .iter()
+            .copied()
+            .find(|&i| i > self.cursor)
+            .unwrap_or(anchors[0]);
+        self.cursor = target;
+        self.cursor_visible = true;
+        self.ensure_cursor_visible();
+        true
     }
 
     pub fn jump_prev_hunk(&mut self) {

@@ -177,7 +177,7 @@ fn run_loop<B: ratatui::backend::Backend>(
                 if let Event::Mouse(m) = ev {
                     handle_composer_mouse(state, m, &mut composer);
                 } else {
-                    handle_composing(state, &ev, &mut composer);
+                    handle_composing(state, &ev, &mut composer, root, base_sha, head_sha);
                 }
             }
             Mode::Help => {
@@ -265,6 +265,13 @@ fn handle_normal(
         KeyCode::Char('[') => state.jump_prev_file(),
         KeyCode::Char('}') => state.jump_next_hunk(),
         KeyCode::Char('{') => state.jump_prev_hunk(),
+        KeyCode::Char('n') => {
+            if state.jump_next_thread_needing_attention() {
+                state.status = Some("→ next thread awaiting your reply".into());
+            } else {
+                state.status = Some("no threads awaiting your reply".into());
+            }
+        }
         KeyCode::Char('?') => state.mode = Mode::Help,
         KeyCode::Char(' ') => {
             if let Some(fl) = state.flat.get(state.cursor).cloned() {
@@ -898,7 +905,14 @@ fn close_composer(state: &mut AppState, composer: &mut Option<TextArea<'static>>
     state.rebuild_flat();
 }
 
-fn handle_composing(state: &mut AppState, ev: &Event, composer: &mut Option<TextArea<'static>>) {
+fn handle_composing(
+    state: &mut AppState,
+    ev: &Event,
+    composer: &mut Option<TextArea<'static>>,
+    root: &std::path::Path,
+    base_sha: Option<&str>,
+    head_sha: Option<&str>,
+) {
     let Event::Key(key) = ev else { return };
     if key.kind != KeyEventKind::Press {
         return;
@@ -931,13 +945,36 @@ fn handle_composing(state: &mut AppState, ev: &Event, composer: &mut Option<Text
             if body.is_empty() {
                 state.status = Some("empty comment, cancelled".into());
             } else if state.save_composer(target, body) {
+                // Persist to the JSON store on every save so a crash before
+                // submit doesn't lose work.
+                let _ = review::save_drafts(root, &state.source, &state.drafts);
+                let is_reply = matches!(
+                    target,
+                    ComposerTarget::NewReply(_) | ComposerTarget::EditReply { .. }
+                );
+                // Replies auto-flush to REVIEW.md so an agent watching the file
+                // sees them immediately — no need to wait for `S`.
+                let mut suffix = "press S to submit".to_string();
+                if is_reply {
+                    if let Ok(p) = review::write_review(
+                        root,
+                        &state.source,
+                        &state.source_label,
+                        base_sha,
+                        head_sha,
+                        &state.drafts,
+                        state.verdict,
+                    ) {
+                        suffix = format!("REVIEW.md updated → {}", p.display());
+                    }
+                }
                 let msg = match target {
                     ComposerTarget::NewDraft => "draft saved",
                     ComposerTarget::EditDraft(_) => "comment edited",
                     ComposerTarget::EditReply { .. } => "reply edited",
                     ComposerTarget::NewReply(_) => "reply added",
                 };
-                state.status = Some(format!("{msg} (press S to submit)"));
+                state.status = Some(format!("{msg} ({suffix})"));
             }
             close_composer(state, composer);
         }

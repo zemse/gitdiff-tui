@@ -392,7 +392,7 @@ fn draw_footer(f: &mut Frame, area: Rect, state: &AppState) {
             "selection · c comment · y copy · esc clear · click elsewhere clears"
         }
         Mode::Normal => {
-            "j/k · ]/[ file · }/{ hunk · e tree · t pick · R drafts · v viewed · y yank · c comment · S submit · ? help · q quit"
+            "j/k · ]/[ file · }/{ hunk · n next-reply · e tree · t pick · R drafts · v viewed · y yank · c comment · S submit · ? help · q quit"
         }
         Mode::Composing => match state.composer_target {
             Some(ComposerTarget::EditDraft(_)) => {
@@ -824,6 +824,7 @@ fn render_code_line(
     let border_color = match range_draft {
         Some(d) if d.resolved => Color::Green,
         Some(d) if d.outdated => Color::Rgb(220, 160, 50),
+        Some(d) if app::needs_attention(d) => Color::Rgb(200, 130, 230),
         Some(_) => Color::Yellow,
         None => BORDER_FG,
     };
@@ -967,10 +968,15 @@ fn render_draft_row(state: &AppState, draft_idx: usize, sub: usize, width: usize
         Some(d) => d,
         None => return Line::from(""),
     };
-    // Match draw_composer's Block style exactly.
+    // Threads whose last message isn't yours get a brighter purple frame so
+    // they stand out as "your turn". Other states keep the yellow frame.
+    let attn = app::needs_attention(d);
     const BOX_BG: Color = Color::Rgb(20, 28, 40);
-    let border = Style::default().fg(Color::Yellow).bg(BOX_BG);
-    let bg = Style::default().bg(BOX_BG);
+    const ATTN_BOX_BG: Color = Color::Rgb(36, 24, 48);
+    let box_bg = if attn { ATTN_BOX_BG } else { BOX_BG };
+    let frame_fg = if attn { Color::Rgb(200, 130, 230) } else { Color::Yellow };
+    let border = Style::default().fg(frame_fg).bg(box_bg);
+    let bg = Style::default().bg(box_bg);
     let text = bg.fg(Color::Rgb(220, 230, 245));
     let muted = bg.fg(Color::Rgb(150, 160, 180));
 
@@ -1508,6 +1514,7 @@ fn draw_help(f: &mut Frame, area: Rect) {
         Line::from("  c            add / edit comment on current line"),
         Line::from("  enter        save comment (composer)"),
         Line::from("  shift-enter  insert newline (composer)"),
+        Line::from("  n            jump to next thread where last reply isn't yours"),
         Line::from("  x            delete comment on current line"),
         Line::from("  ctrl-d       delete comment from edit mode (in composer)"),
         Line::from("  S            submit drafts → REVIEW.md at repo root"),
