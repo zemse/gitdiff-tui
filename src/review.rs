@@ -97,6 +97,50 @@ pub fn save_threads(root: &Path, source: &DiffSource, threads: &[Thread]) -> Res
     Ok(())
 }
 
+/// TUI-side save that re-reads the on-disk JSON, merges any new threads /
+/// replies the CLI added while the TUI was running, then writes the union.
+/// Without this the TUI's stale in-memory snapshot clobbers every concurrent
+/// `gitdiff comment`/`gitdiff reply` invocation.
+///
+/// Merge rules:
+///   - Thread on disk but not in memory → appended to memory (CLI created it).
+///   - Thread in both → kept in memory; any disk-only reply is appended,
+///     deduped by (author, created_at, body-modulo-trailing-ws).
+///   - In-memory mutations to body/resolved/reactions win (the user just
+///     edited them in the TUI; the CLI rarely touches these).
+///
+/// Deletions made in the TUI are a known limitation: if the CLI raced a
+/// reply onto a thread the user deleted, the thread comes back at next save.
+/// That's a rare-enough collision to defer until we have proper locking.
+pub fn save_threads_merging(
+    root: &Path,
+    source: &DiffSource,
+    threads: &mut Vec<Thread>,
+) -> Result<()> {
+    let on_disk = load_threads(root, source).unwrap_or_default();
+    for disk_thread in on_disk {
+        match threads
+            .iter_mut()
+            .find(|t| t.thread_id == disk_thread.thread_id)
+        {
+            Some(in_mem) => {
+                for dr in disk_thread.replies {
+                    let dup = in_mem.replies.iter().any(|x| {
+                        x.author == dr.author
+                            && x.created_at == dr.created_at
+                            && x.body.trim_end() == dr.body.trim_end()
+                    });
+                    if !dup {
+                        in_mem.replies.push(dr);
+                    }
+                }
+            }
+            None => threads.push(disk_thread),
+        }
+    }
+    save_threads(root, source, threads)
+}
+
 const AGENT_INSTRUCTIONS: &str = "<!--
 INSTRUCTIONS FOR CODING AGENTS (claude-code, codex, gemini, etc.)
 =================================================================
@@ -293,12 +337,24 @@ pub fn parse_review_replies(text: &str) -> HashMap<String, ThreadImport> {
                 continue;
             }
             // Parse: > [@handle 2026-05-24T17:05:00Z] body...
+            // Header lookup uses the trim_end'd line (`]` and timestamp are
+            // ASCII). The body uses the *raw* line so leading whitespace
+            // inside the body survives — write_review emits exactly one
+            // separator space after `]`, and code-block lines carry real
+            // 4-space indentation we must preserve. trim_start() would
+            // strip both, making the next roundtrip's body differ from the
+            // in-memory original and bypassing the dedupe check → the same
+            // reply gets re-imported every time the TUI sees the file.
             let rest = &line[3..]; // drop "> ["
             let Some(close_br) = rest.find(']') else {
                 continue;
             };
             let header = &rest[1..close_br]; // skip leading '@'
-            let body_part = rest[close_br + 1..].trim_start();
+            // Indices are the same in `line` and `raw` because trim_end
+            // only differs in the tail; slice the raw form so trailing
+            // characters survive untouched.
+            let after_br = &raw[close_br + 4..]; // past "> [" + "]"
+            let body_part = after_br.strip_prefix(' ').unwrap_or(after_br);
             let mut it = header.splitn(2, ' ');
             let author = it.next().unwrap_or("").trim().to_string();
             let ts_str = it.next().unwrap_or("").trim();

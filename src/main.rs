@@ -23,6 +23,131 @@ use std::io;
 use std::time::Duration;
 use tui_textarea::{CursorMove, TextArea};
 
+/// Body comparison used by every reply-dedupe path: ignores trailing
+/// whitespace so an in-memory body of "X\n" and its round-tripped form "X"
+/// (write_review's `r.body.lines()` drops the trailing newline) compare equal.
+/// Without this, dedupe missed and the same reply got re-appended on every
+/// REVIEW.md import.
+fn bodies_equivalent(a: &str, b: &str) -> bool {
+    a.trim_end() == b.trim_end()
+}
+
+/// True if `r` already exists in `replies` (matched on author + timestamp +
+/// body modulo trailing whitespace).
+fn reply_is_duplicate(replies: &[app::Reply], r: &app::Reply) -> bool {
+    replies.iter().any(|x| {
+        x.author == r.author
+            && x.created_at == r.created_at
+            && bodies_equivalent(&x.body, &r.body)
+    })
+}
+
+/// Heal duplicates produced by older builds: when two replies share author +
+/// timestamp and their bodies match after leading-whitespace + trailing-ws
+/// normalization, the second is the lossy roundtrip copy — drop it, keep the
+/// longer-bodied original.
+fn heal_lossy_roundtrip_dups(replies: &mut Vec<app::Reply>) {
+    fn normalize(b: &str) -> String {
+        b.lines()
+            .map(|l| l.trim_start())
+            .collect::<Vec<_>>()
+            .join("\n")
+            .trim_end()
+            .to_string()
+    }
+    let mut keep = vec![true; replies.len()];
+    for i in 0..replies.len() {
+        if !keep[i] {
+            continue;
+        }
+        for j in (i + 1)..replies.len() {
+            if !keep[j] {
+                continue;
+            }
+            let a = &replies[i];
+            let b = &replies[j];
+            if a.author != b.author || a.created_at != b.created_at {
+                continue;
+            }
+            if normalize(&a.body) != normalize(&b.body) {
+                continue;
+            }
+            // Same fingerprint after normalization → drop the shorter copy.
+            if a.body.len() >= b.body.len() {
+                keep[j] = false;
+            } else {
+                keep[i] = false;
+                break; // i is gone — outer loop will skip it
+            }
+        }
+    }
+    let mut idx = 0;
+    replies.retain(|_| {
+        let k = keep[idx];
+        idx += 1;
+        k
+    });
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use chrono::TimeZone;
+
+    fn reply(author: &str, ts_ns: u32, body: &str) -> app::Reply {
+        app::Reply {
+            author: author.to_string(),
+            body: body.to_string(),
+            created_at: chrono::Utc.timestamp_opt(1_700_000_000, ts_ns).unwrap(),
+        }
+    }
+
+    #[test]
+    fn dedupe_ignores_trailing_newline() {
+        assert!(bodies_equivalent("hello\n", "hello"));
+        assert!(bodies_equivalent("hello\n\n", "hello"));
+        assert!(bodies_equivalent("a\nb\n", "a\nb"));
+        assert!(!bodies_equivalent("a\nb", "a b"));
+    }
+
+    #[test]
+    fn heal_removes_leading_ws_stripped_copy() {
+        let original = "fn foo() {\n    let x = 1;\n}";
+        let stripped = "fn foo() {\nlet x = 1;\n}";
+        let mut replies = vec![
+            reply("claude-code", 1_000, original),
+            reply("you", 2_000, "human reply"),
+            reply("claude-code", 1_000, stripped),
+        ];
+        heal_lossy_roundtrip_dups(&mut replies);
+        assert_eq!(replies.len(), 2);
+        assert_eq!(replies[0].body, original); // longer body kept
+        assert_eq!(replies[1].author, "you");
+    }
+
+    #[test]
+    fn heal_removes_trailing_newline_copy() {
+        let mut replies = vec![
+            reply("a", 1_000, "X\n"),
+            reply("a", 1_000, "X"),
+        ];
+        heal_lossy_roundtrip_dups(&mut replies);
+        assert_eq!(replies.len(), 1);
+        assert_eq!(replies[0].body, "X\n"); // longer kept
+    }
+
+    #[test]
+    fn heal_keeps_distinct_replies() {
+        let mut replies = vec![
+            reply("a", 1_000, "first"),
+            reply("a", 2_000, "second"),
+            reply("a", 1_000, "different"), // same ts but different content
+        ];
+        heal_lossy_roundtrip_dups(&mut replies);
+        assert_eq!(replies.len(), 3);
+    }
+}
+
 fn main() -> Result<()> {
     // Parse argv with clap. Subcommands run inside `parse_and_dispatch` and
     // return `Ok(None)`; the no-subcommand path returns the parsed `Cli` so we
@@ -60,12 +185,8 @@ fn main() -> Result<()> {
             let map = review::parse_review_replies(&text);
             for d in threads.iter_mut() {
                 if let Some(import) = map.get(&d.thread_id) {
-                    // Dedupe by (author, created_at, body); append the rest.
                     for r in &import.replies {
-                        let dup = d.replies.iter().any(|x| {
-                            x.author == r.author && x.created_at == r.created_at && x.body == r.body
-                        });
-                        if !dup {
+                        if !reply_is_duplicate(&d.replies, r) {
                             d.replies.push(r.clone());
                             merged_any = true;
                         }
@@ -79,7 +200,7 @@ fn main() -> Result<()> {
         }
     }
     // Cleanup pass for the duplicate-reply drift produced by older builds.
-    // Two passes per thread:
+    // Three passes per thread:
     //   1. Collapse synthetic 'X\nX\n…' bodies. The old parser merged
     //      consecutive '> [@a T] X' lines (same author+ts) into one
     //      multi-line Reply body, and a duplicated line therefore became
@@ -88,6 +209,10 @@ fn main() -> Result<()> {
     //   2. Dedup by (author, body, timestamp-truncated-to-seconds), keeping
     //      the first (most-precise) occurrence. This catches the
     //      microsecond-vs-second-precision drift from the old write_review.
+    //   3. Lossy-roundtrip dedup: drop replies whose body differs from an
+    //      earlier reply (same author+ts) only by leading-whitespace
+    //      stripping or trailing-newline loss. That's the dup pattern
+    //      pre-parse-fix builds produced when re-importing REVIEW.md.
     let mut deduped_any = false;
     for d in threads.iter_mut() {
         let before = d.replies.len();
@@ -101,6 +226,7 @@ fn main() -> Result<()> {
             std::collections::HashSet::new();
         d.replies
             .retain(|r| seen.insert((r.author.clone(), r.body.clone(), r.created_at.timestamp())));
+        heal_lossy_roundtrip_dups(&mut d.replies);
         if d.replies.len() != before {
             deduped_any = true;
         }
@@ -164,7 +290,7 @@ fn main() -> Result<()> {
     )?;
     terminal.show_cursor()?;
 
-    let _ = review::save_threads(&root, &state.source, &state.threads);
+    let _ = review::save_threads_merging(&root, &state.source, &mut state.threads);
     let _ = review::save_viewed(&root, &state.source, &state.viewed);
 
     result
@@ -466,7 +592,7 @@ fn handle_normal(
                 &state.threads,
                 state.verdict,
             )?;
-            review::save_threads(root, &state.source, &state.threads)?;
+            review::save_threads_merging(root, &state.source, &mut state.threads)?;
             stamp_review_mtime(state, root);
             state.status = Some(format!("wrote {} ({})", p.display(), state.verdict.label()));
         }
@@ -529,10 +655,7 @@ fn poll_review_file(state: &mut AppState, root: &std::path::Path) -> bool {
     for d in state.threads.iter_mut() {
         if let Some(import) = map.get(&d.thread_id) {
             for r in &import.replies {
-                let dup = d.replies.iter().any(|x| {
-                    x.author == r.author && x.created_at == r.created_at && x.body == r.body
-                });
-                if !dup {
+                if !reply_is_duplicate(&d.replies, r) {
                     d.replies.push(r.clone());
                     changed = true;
                 }
@@ -544,7 +667,7 @@ fn poll_review_file(state: &mut AppState, root: &std::path::Path) -> bool {
         }
     }
     if changed {
-        let _ = review::save_threads(root, &state.source, &state.threads);
+        let _ = review::save_threads_merging(root, &state.source, &mut state.threads);
         state.rebuild_flat();
         state.status = Some("imported replies from REVIEW.md".into());
     }
@@ -1073,7 +1196,7 @@ fn handle_composing(
             } else if state.save_composer(target, body) {
                 // Persist to the JSON store on every save so a crash before
                 // submit doesn't lose work.
-                let _ = review::save_threads(root, &state.source, &state.threads);
+                let _ = review::save_threads_merging(root, &state.source, &mut state.threads);
                 let is_reply = matches!(
                     target,
                     ComposerTarget::NewReply(_) | ComposerTarget::EditReply { .. }
