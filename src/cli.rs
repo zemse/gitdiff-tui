@@ -148,6 +148,31 @@ pub enum Commands {
         #[arg(long)]
         reply: Option<usize>,
     },
+
+    /// Stream new threads/replies/resolves to stdout as the JSON store
+    /// changes. Lets an agent react to each human reply the moment it lands
+    /// instead of polling or waiting for a batch.
+    ///
+    /// Existing content is *not* re-emitted at startup; only deltas. Use
+    /// `gitdiff list` first if you need a baseline.
+    ///
+    /// Exits on Ctrl-C. Stdout is line-flushed so a pipeline reader sees
+    /// each event immediately.
+    Watch {
+        /// Optional `<base>..<head>` range; auto-detected if absent.
+        range: Option<String>,
+        /// Only emit events whose author matches (e.g. `--author you` to
+        /// watch human replies and skip the agent's own writes).
+        #[arg(long)]
+        author: Option<String>,
+        /// Poll interval in milliseconds. Lower = snappier, higher = cheaper.
+        #[arg(long, default_value_t = 500)]
+        interval_ms: u64,
+        /// Emit one JSON object per line (machine-readable). Default is
+        /// short human-readable lines.
+        #[arg(long)]
+        json: bool,
+    },
 }
 
 /// Mutually-exclusive body source. clap enforces "exactly one" at parse time
@@ -560,6 +585,188 @@ fn cmd_delete(thread_id: String, range: Option<String>, reply: Option<usize>) ->
 }
 
 // ----------------------------------------------------------------------------
+// Watch
+// ----------------------------------------------------------------------------
+
+/// Polls the threads JSON for new threads/replies/resolves and emits one
+/// event per line. The expected consumer is an agent that wants to react
+/// to each human reply as it lands, instead of waiting for the human to
+/// finish a batch and then processing in bulk.
+///
+/// Implementation notes:
+///   - mtime check skips the parse when the file hasn't changed.
+///   - Baseline is taken at startup so existing replies don't re-emit.
+///   - Stdout is flushed after every event so a piped reader sees them.
+///   - Author filter is matched verbatim. Pass `--author you` to watch
+///     only human messages; the agent's own replies (`--author claude-code`,
+///     etc.) are skipped.
+fn cmd_watch(
+    range: Option<String>,
+    author_filter: Option<String>,
+    interval_ms: u64,
+    as_json: bool,
+) -> Result<()> {
+    use std::collections::HashSet;
+    use std::io::Write;
+    use std::time::Duration;
+
+    let (root, source) = resolve_source(range)?;
+    let threads_p = review::threads_path(&root, &source);
+
+    type ReplyKey = (String, String, chrono::DateTime<chrono::Utc>);
+    fn rkey(tid: &str, r: &Reply) -> ReplyKey {
+        (tid.to_string(), r.author.clone(), r.created_at)
+    }
+
+    let mut seen_threads: HashSet<String> = HashSet::new();
+    let mut seen_replies: HashSet<ReplyKey> = HashSet::new();
+    let mut seen_resolved: HashSet<String> = HashSet::new();
+
+    // Baseline pass — do NOT emit; we only stream deltas from here on.
+    let baseline = review::load_threads(&root, &source).unwrap_or_default();
+    for t in &baseline {
+        seen_threads.insert(t.thread_id.clone());
+        if t.resolved {
+            seen_resolved.insert(t.thread_id.clone());
+        }
+        for r in &t.replies {
+            seen_replies.insert(rkey(&t.thread_id, r));
+        }
+    }
+
+    eprintln!(
+        "gitdiff watch: {} (every {}ms; baseline {} thread(s), {} repl(ies)). Ctrl-C to exit.",
+        source.label(),
+        interval_ms,
+        baseline.len(),
+        seen_replies.len()
+    );
+
+    let interval = Duration::from_millis(interval_ms.max(50));
+    let stdout = std::io::stdout();
+    let mut last_mtime: Option<std::time::SystemTime> = std::fs::metadata(&threads_p)
+        .and_then(|m| m.modified())
+        .ok();
+
+    loop {
+        std::thread::sleep(interval);
+
+        // Cheap path: file unchanged → don't even parse.
+        let mtime = std::fs::metadata(&threads_p)
+            .and_then(|m| m.modified())
+            .ok();
+        if mtime == last_mtime {
+            continue;
+        }
+        last_mtime = mtime;
+
+        // load_threads errors on a half-written file (the TUI/CLI can be
+        // mid-write). Just skip; next tick will catch the settled state.
+        let threads = match review::load_threads(&root, &source) {
+            Ok(t) => t,
+            Err(_) => continue,
+        };
+
+        let mut out = stdout.lock();
+        for t in &threads {
+            if seen_threads.insert(t.thread_id.clone())
+                && author_filter.is_none()
+            {
+                emit_event(&mut out, as_json, "new_thread", t, None)?;
+            }
+            for (i, r) in t.replies.iter().enumerate() {
+                if !seen_replies.insert(rkey(&t.thread_id, r)) {
+                    continue;
+                }
+                let pass = author_filter
+                    .as_deref()
+                    .map(|f| f == r.author)
+                    .unwrap_or(true);
+                if pass {
+                    emit_event(&mut out, as_json, "new_reply", t, Some((i, r)))?;
+                }
+            }
+            if t.resolved
+                && seen_resolved.insert(t.thread_id.clone())
+                && author_filter.is_none()
+            {
+                emit_event(&mut out, as_json, "resolved", t, None)?;
+            }
+        }
+        let _ = out.flush();
+    }
+}
+
+fn emit_event(
+    out: &mut impl std::io::Write,
+    as_json: bool,
+    event: &str,
+    t: &Thread,
+    reply: Option<(usize, &Reply)>,
+) -> Result<()> {
+    if as_json {
+        let mut obj = serde_json::json!({
+            "event": event,
+            "thread_id": t.thread_id,
+            "file": t.file_path,
+            "anchor": t.anchor_label(),
+        });
+        if t.resolved {
+            obj["resolved"] = serde_json::Value::Bool(true);
+        }
+        if let Some((idx, r)) = reply {
+            obj["reply_index"] = serde_json::json!(idx);
+            obj["author"] = serde_json::json!(r.author);
+            obj["created_at"] = serde_json::json!(
+                r.created_at.format("%Y-%m-%dT%H:%M:%SZ").to_string()
+            );
+            obj["body"] = serde_json::json!(r.body);
+        }
+        writeln!(out, "{obj}")?;
+    } else {
+        let ts = chrono::Utc::now().format("%H:%M:%S");
+        match reply {
+            Some((i, r)) => {
+                let preview: String = r
+                    .body
+                    .lines()
+                    .next()
+                    .unwrap_or("")
+                    .chars()
+                    .take(80)
+                    .collect();
+                writeln!(
+                    out,
+                    "[{ts}] {event} {tid} {file}:{anchor} reply#{i} @{author}\n    {preview}",
+                    tid = t.thread_id,
+                    file = t.file_path,
+                    anchor = t.anchor_label(),
+                    author = r.author,
+                )?;
+            }
+            None => {
+                let preview: String = t
+                    .body
+                    .lines()
+                    .next()
+                    .unwrap_or("")
+                    .chars()
+                    .take(80)
+                    .collect();
+                writeln!(
+                    out,
+                    "[{ts}] {event} {tid} {file}:{anchor}\n    {preview}",
+                    tid = t.thread_id,
+                    file = t.file_path,
+                    anchor = t.anchor_label(),
+                )?;
+            }
+        }
+    }
+    Ok(())
+}
+
+// ----------------------------------------------------------------------------
 // Help trailer ("what would I auto-detect right now?")
 // ----------------------------------------------------------------------------
 
@@ -662,6 +869,12 @@ pub fn parse_and_dispatch() -> Result<Option<Cli>> {
             range,
             reply,
         } => cmd_delete(thread_id, range, reply)?,
+        Commands::Watch {
+            range,
+            author,
+            interval_ms,
+            json,
+        } => cmd_watch(range, author, interval_ms, json)?,
     }
     Ok(None)
 }
