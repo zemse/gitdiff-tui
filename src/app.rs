@@ -327,6 +327,16 @@ pub struct AppState {
     // frame, then re-populated by render passes. RefCell so the render
     // functions can keep their `&AppState` signature.
     pub hover_regions: RefCell<Vec<HoverRegion>>,
+    // (thread_id, author, old_created_at) of replies the user has edited or
+    // deleted locally since the last successful save. `save_threads_merging`
+    // consults this so the on-disk version of an edited reply (still carrying
+    // the pre-edit ts + body) isn't reanimated as a "new disk addition" and
+    // re-appended after the edited copy. Cleared after every successful save.
+    pub suppressed_disk_replies: HashSet<(String, String, chrono::DateTime<chrono::Utc>)>,
+    // thread_ids the user has deleted locally since the last successful save.
+    // Without this, the merge would see the still-on-disk thread, find no
+    // memory match, and resurrect it as a "CLI addition".
+    pub suppressed_thread_ids: HashSet<String>,
 }
 
 #[derive(Debug, Clone)]
@@ -395,6 +405,8 @@ impl AppState {
             last_review_mtime: None,
             hover_pos: None,
             hover_regions: RefCell::new(Vec::new()),
+            suppressed_disk_replies: HashSet::new(),
+            suppressed_thread_ids: HashSet::new(),
         };
         // start on first code line if possible
         if let Some(i) = s.flat.iter().position(|l| l.kind == FlatKind::Code) {
@@ -1275,6 +1287,19 @@ impl AppState {
                 thread_idx,
                 reply_idx,
             } => {
+                // Suppress the pre-edit identity so the merge-save doesn't
+                // see the stale on-disk version and re-append it as a fresh
+                // reply (which is exactly what made an "edit" look like a
+                // new reply post-merging-save landed).
+                if let Some(d) = self.threads.get(thread_idx) {
+                    if let Some(r) = d.replies.get(reply_idx) {
+                        self.suppressed_disk_replies.insert((
+                            d.thread_id.clone(),
+                            r.author.clone(),
+                            r.created_at,
+                        ));
+                    }
+                }
                 if let Some(r) = self
                     .threads
                     .get_mut(thread_idx)
@@ -1420,6 +1445,8 @@ impl AppState {
 
     pub fn delete_thread_at_cursor(&mut self) -> bool {
         if let Some(idx) = self.thread_for_cursor() {
+            self.suppressed_thread_ids
+                .insert(self.threads[idx].thread_id.clone());
             self.threads.remove(idx);
             true
         } else {

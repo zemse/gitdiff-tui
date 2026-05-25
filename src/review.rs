@@ -2,7 +2,7 @@ use crate::app::{Reply, Thread, Verdict};
 use crate::git::DiffSource;
 use anyhow::{Context, Result};
 use chrono::{DateTime, Utc};
-use std::collections::{BTreeMap, HashMap};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::fs;
 use std::path::{Path, PathBuf};
 
@@ -103,28 +103,41 @@ pub fn save_threads(root: &Path, source: &DiffSource, threads: &[Thread]) -> Res
 /// `gitdiff comment`/`gitdiff reply` invocation.
 ///
 /// Merge rules:
-///   - Thread on disk but not in memory → appended to memory (CLI created it).
+///   - Thread on disk but not in memory → appended to memory (CLI created it),
+///     unless its id appears in `suppressed_threads` (user deleted it in TUI).
 ///   - Thread in both → kept in memory; any disk-only reply is appended,
-///     deduped by (author, created_at, body-modulo-trailing-ws).
+///     deduped by (author, created_at, body-modulo-trailing-ws). A disk
+///     reply whose (thread_id, author, created_at) appears in
+///     `suppressed_replies` is skipped — that's the pre-edit ghost of a
+///     reply the user just modified, and re-appending it would resurrect
+///     the original alongside the edited copy (visible as "my edit posted
+///     a fresh reply instead of replacing my own").
 ///   - In-memory mutations to body/resolved/reactions win (the user just
 ///     edited them in the TUI; the CLI rarely touches these).
 ///
-/// Deletions made in the TUI are a known limitation: if the CLI raced a
-/// reply onto a thread the user deleted, the thread comes back at next save.
-/// That's a rare-enough collision to defer until we have proper locking.
+/// Both suppression sets are cleared after a successful save: the disk now
+/// reflects the post-edit state, so keeping stale identities around could
+/// drop a legitimate future CLI write that happens to collide.
 pub fn save_threads_merging(
     root: &Path,
     source: &DiffSource,
     threads: &mut Vec<Thread>,
+    suppressed_replies: &mut HashSet<(String, String, DateTime<Utc>)>,
+    suppressed_threads: &mut HashSet<String>,
 ) -> Result<()> {
     let on_disk = load_threads(root, source).unwrap_or_default();
     for disk_thread in on_disk {
-        match threads
-            .iter_mut()
-            .find(|t| t.thread_id == disk_thread.thread_id)
-        {
+        if suppressed_threads.contains(&disk_thread.thread_id) {
+            continue;
+        }
+        let tid = disk_thread.thread_id.clone();
+        match threads.iter_mut().find(|t| t.thread_id == tid) {
             Some(in_mem) => {
                 for dr in disk_thread.replies {
+                    let key = (tid.clone(), dr.author.clone(), dr.created_at);
+                    if suppressed_replies.contains(&key) {
+                        continue;
+                    }
                     let dup = in_mem.replies.iter().any(|x| {
                         x.author == dr.author
                             && x.created_at == dr.created_at
@@ -138,7 +151,10 @@ pub fn save_threads_merging(
             None => threads.push(disk_thread),
         }
     }
-    save_threads(root, source, threads)
+    save_threads(root, source, threads)?;
+    suppressed_replies.clear();
+    suppressed_threads.clear();
+    Ok(())
 }
 
 const AGENT_INSTRUCTIONS: &str = "<!--

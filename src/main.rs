@@ -290,7 +290,13 @@ fn main() -> Result<()> {
     )?;
     terminal.show_cursor()?;
 
-    let _ = review::save_threads_merging(&root, &state.source, &mut state.threads);
+    let _ = review::save_threads_merging(
+        &root,
+        &state.source,
+        &mut state.threads,
+        &mut state.suppressed_disk_replies,
+        &mut state.suppressed_thread_ids,
+    );
     let _ = review::save_viewed(&root, &state.source, &state.viewed);
 
     result
@@ -592,7 +598,13 @@ fn handle_normal(
                 &state.threads,
                 state.verdict,
             )?;
-            review::save_threads_merging(root, &state.source, &mut state.threads)?;
+            review::save_threads_merging(
+                root,
+                &state.source,
+                &mut state.threads,
+                &mut state.suppressed_disk_replies,
+                &mut state.suppressed_thread_ids,
+            )?;
             stamp_review_mtime(state, root);
             state.status = Some(format!("wrote {} ({})", p.display(), state.verdict.label()));
         }
@@ -667,7 +679,13 @@ fn poll_review_file(state: &mut AppState, root: &std::path::Path) -> bool {
         }
     }
     if changed {
-        let _ = review::save_threads_merging(root, &state.source, &mut state.threads);
+        let _ = review::save_threads_merging(
+            root,
+            &state.source,
+            &mut state.threads,
+            &mut state.suppressed_disk_replies,
+            &mut state.suppressed_thread_ids,
+        );
         state.rebuild_flat();
         state.status = Some("imported replies from REVIEW.md".into());
     }
@@ -1196,7 +1214,13 @@ fn handle_composing(
             } else if state.save_composer(target, body) {
                 // Persist to the JSON store on every save so a crash before
                 // submit doesn't lose work.
-                let _ = review::save_threads_merging(root, &state.source, &mut state.threads);
+                let _ = review::save_threads_merging(
+            root,
+            &state.source,
+            &mut state.threads,
+            &mut state.suppressed_disk_replies,
+            &mut state.suppressed_thread_ids,
+        );
                 let is_reply = matches!(
                     target,
                     ComposerTarget::NewReply(_) | ComposerTarget::EditReply { .. }
@@ -1234,6 +1258,9 @@ fn handle_composing(
             // nuking a thread someone replied to.
             match state.composer_target {
                 Some(ComposerTarget::EditThread(idx)) => {
+                    state
+                        .suppressed_thread_ids
+                        .insert(state.threads[idx].thread_id.clone());
                     state.threads.remove(idx);
                     close_composer(state, composer);
                     state.status = Some("thread deleted".into());
