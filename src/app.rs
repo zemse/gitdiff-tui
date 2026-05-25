@@ -1579,6 +1579,29 @@ pub fn reanchor_threads(threads: &mut [Thread], files: &[FileDiff]) -> bool {
             if let Some(l) = anchor_now {
                 d.anchor_content = l.content.clone();
                 changed = true;
+            } else {
+                // CLI-created threads stored only one side (e.g. `--side new`
+                // gave `(None, Some(line))`), so the strict `(old, new)`
+                // match above misses context lines whose diff row is
+                // `(Some, Some)`. Fall back to matching by the populated
+                // side alone; if it's unique enough we adopt the diff row's
+                // full pair and snap the thread to it.
+                let target = d.new_lineno.or(d.old_lineno);
+                let by_new = d.new_lineno.is_some();
+                if let Some(l) = file.hunks.iter().find_map(|h| {
+                    h.lines.iter().find(|l| {
+                        if by_new {
+                            l.new_lineno == target
+                        } else {
+                            l.old_lineno == target
+                        }
+                    })
+                }) {
+                    d.old_lineno = l.old_lineno;
+                    d.new_lineno = l.new_lineno;
+                    d.anchor_content = l.content.clone();
+                    changed = true;
+                }
             }
             continue;
         }

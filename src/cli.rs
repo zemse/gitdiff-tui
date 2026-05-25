@@ -13,6 +13,7 @@ use clap::{Args, CommandFactory, Parser, Subcommand};
 use std::path::PathBuf;
 
 use crate::app::{LOCAL_AUTHOR, Reply, Thread, make_thread_id};
+use crate::diff::{self, FileDiff, LineKind};
 use crate::git::{self, DiffOpts, DiffSource};
 use crate::review;
 
@@ -333,6 +334,50 @@ fn cmd_show(thread_id: String, range: Option<String>, as_json: bool) -> Result<(
     Ok(())
 }
 
+/// Resolved anchor information for a (file, line, side) the caller wants to
+/// pin a comment to. `old_lineno`/`new_lineno` mirror the matched diff line so
+/// the TUI's `(old, new)` lookup later finds the same row (critical: context
+/// lines have *both* fields set — storing only the requested side trivially
+/// fails that match and the thread shows up as `outdated`/hidden).
+struct ResolvedAnchor {
+    old_lineno: Option<usize>,
+    new_lineno: Option<usize>,
+    content: String,
+    kind: LineKind,
+}
+
+/// Walk the parsed diff for the requested side+lineno. `None` means the line
+/// isn't covered by any hunk — caller falls back to one-sided storage and
+/// the thread will be marked outdated until the diff catches up to it.
+fn resolve_anchor(file_diff: &FileDiff, line: usize, side: &str) -> Option<ResolvedAnchor> {
+    for h in &file_diff.hunks {
+        for l in &h.lines {
+            let hit = if side == "new" {
+                l.new_lineno == Some(line)
+            } else {
+                l.old_lineno == Some(line)
+            };
+            if hit {
+                return Some(ResolvedAnchor {
+                    old_lineno: l.old_lineno,
+                    new_lineno: l.new_lineno,
+                    content: l.content.clone(),
+                    kind: l.kind,
+                });
+            }
+        }
+    }
+    None
+}
+
+fn kind_label(k: LineKind) -> &'static str {
+    match k {
+        LineKind::Added => "added",
+        LineKind::Deleted => "deleted",
+        LineKind::Context => "context",
+    }
+}
+
 #[allow(clippy::too_many_arguments)]
 fn cmd_comment(
     file: String,
@@ -347,17 +392,49 @@ fn cmd_comment(
     let (root, source) = resolve_source(range)?;
     let mut threads = review::load_threads(&root, &source)?;
 
+    // Look up the real diff line so context-line anchors store both
+    // (old, new) fields — without this, threads on unchanged lines never
+    // re-match in the TUI and get hidden as outdated.
+    let raw_diff = git::get_diff(&root, &source, DiffOpts::default())?;
+    let files = diff::parse(&raw_diff)?;
+    let file_diff = files.iter().find(|f| f.path == file);
+
+    let anchor = file_diff.and_then(|fd| resolve_anchor(fd, line, &side));
+    let (old_lineno, new_lineno, anchor_content, line_kind) = match &anchor {
+        Some(a) => (
+            a.old_lineno,
+            a.new_lineno,
+            a.content.clone(),
+            kind_label(a.kind).to_string(),
+        ),
+        None => {
+            let (o, n) = if side == "new" {
+                (None, Some(line))
+            } else {
+                (Some(line), None)
+            };
+            (o, n, String::new(), "context".to_string())
+        }
+    };
+
+    let (old_end, new_end) = match end {
+        Some(e) => {
+            let resolved = file_diff.and_then(|fd| resolve_anchor(fd, e, &side));
+            match resolved {
+                Some(a) => (a.old_lineno, a.new_lineno),
+                None => {
+                    if side == "new" {
+                        (None, Some(e))
+                    } else {
+                        (Some(e), None)
+                    }
+                }
+            }
+        }
+        None => (None, None),
+    };
+
     let created_at = Utc::now();
-    let (old_lineno, new_lineno) = if side == "new" {
-        (None, Some(line))
-    } else {
-        (Some(line), None)
-    };
-    let (old_end, new_end) = match (end, side.as_str()) {
-        (Some(e), "new") => (None, Some(e)),
-        (Some(e), _) => (Some(e), None),
-        (None, _) => (None, None),
-    };
     let thread_id = make_thread_id(&file, old_lineno, new_lineno, &created_at);
 
     // If the author isn't the local human, record the message as the first
@@ -382,7 +459,7 @@ fn cmd_comment(
         new_lineno,
         old_lineno_end: old_end,
         new_lineno_end: new_end,
-        line_kind: "context".to_string(),
+        line_kind,
         diff_snippet: String::new(),
         body: body_field,
         created_at,
@@ -391,7 +468,7 @@ fn cmd_comment(
         reactions: Vec::new(),
         thread_id: thread_id.clone(),
         replies,
-        anchor_content: String::new(),
+        anchor_content,
     });
     review::save_threads(&root, &source, &threads)?;
     println!("{thread_id}");
