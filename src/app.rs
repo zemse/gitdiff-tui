@@ -66,6 +66,13 @@ pub struct Thread {
     /// the lineno to the closest match.
     #[serde(default)]
     pub anchor_content: String,
+    /// Timestamp the user last said "I've seen this — stop nagging me" on
+    /// a thread whose last message wasn't theirs. Suppresses the "awaiting
+    /// your reply" purple highlight in the TUI as long as no newer reply
+    /// arrives. A reply with a later `created_at` automatically re-arms the
+    /// highlight without needing the user to un-ack first.
+    #[serde(default)]
+    pub acknowledged_at: Option<DateTime<Utc>>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -84,15 +91,23 @@ pub const LOCAL_AUTHOR: &str = "you";
 
 /// A thread "needs your attention" when it's still open and the last message
 /// in the conversation isn't yours — i.e. an agent (or someone else) replied
-/// and you haven't responded.
+/// and you haven't responded. Acknowledging the thread (`m`) silences the
+/// nag until a *newer* reply arrives, so users can end a conversation on
+/// the other side's reply without having to leave a perfunctory "thanks".
 pub fn needs_attention(d: &Thread) -> bool {
     if d.resolved {
         return false;
     }
-    d.replies
-        .last()
-        .map(|r| r.author != LOCAL_AUTHOR)
-        .unwrap_or(false)
+    let Some(last) = d.replies.last() else {
+        return false;
+    };
+    if last.author == LOCAL_AUTHOR {
+        return false;
+    }
+    match d.acknowledged_at {
+        Some(ack) if ack >= last.created_at => false,
+        _ => true,
+    }
 }
 
 /// What the composer is operating on. The thread editing rules are:
@@ -1395,6 +1410,7 @@ impl AppState {
             thread_id,
             replies: Vec::new(),
             anchor_content: last_line.content.clone(),
+            acknowledged_at: None,
         });
         Some(())
     }
@@ -1425,6 +1441,28 @@ impl AppState {
         let idx = self.thread_for_cursor()?;
         self.threads[idx].resolved = !self.threads[idx].resolved;
         Some(self.threads[idx].resolved)
+    }
+
+    /// Toggle "I've seen this" on the thread at the cursor. Returns
+    /// `Some(true)` when the thread is now silenced, `Some(false)` when the
+    /// ack was cleared (re-arming the purple highlight), or `None` when
+    /// there's no thread at the cursor. Acking a thread whose last reply
+    /// is already yours is a no-op — there was nothing to silence.
+    pub fn toggle_acknowledged_at_cursor(&mut self) -> Option<bool> {
+        let idx = self.thread_for_cursor()?;
+        let d = &mut self.threads[idx];
+        let last = d.replies.last()?;
+        if last.author == LOCAL_AUTHOR {
+            return None;
+        }
+        let last_ts = last.created_at;
+        if matches!(d.acknowledged_at, Some(ack) if ack >= last_ts) {
+            d.acknowledged_at = None;
+            Some(false)
+        } else {
+            d.acknowledged_at = Some(Utc::now());
+            Some(true)
+        }
     }
 
     pub fn mark_outdated_threads(&mut self) {

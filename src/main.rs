@@ -619,6 +619,17 @@ fn handle_normal(
                 state.status = Some("no thread at cursor".into());
             }
         }
+        KeyCode::Char('m') => {
+            match state.toggle_acknowledged_at_cursor() {
+                Some(true) => state.status = Some("marked read (silenced)".into()),
+                Some(false) => state.status = Some("marked unread".into()),
+                None => state.status = Some("nothing to mark — last reply is yours".into()),
+            }
+            // The flatten cache and status bar both branch on
+            // needs_attention; force a re-flatten so the border color
+            // updates this frame instead of next.
+            state.rebuild_flat();
+        }
         KeyCode::Char('V') => {
             state.verdict = state.verdict.cycle();
             state.status = Some(format!("verdict: {}", state.verdict.label()));

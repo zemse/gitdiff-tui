@@ -494,6 +494,7 @@ fn cmd_comment(
         thread_id: thread_id.clone(),
         replies,
         anchor_content,
+        acknowledged_at: None,
     });
     review::save_threads(&root, &source, &threads)?;
     println!("{thread_id}");

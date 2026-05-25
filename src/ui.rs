@@ -501,7 +501,7 @@ fn draw_footer(f: &mut Frame, area: Rect, state: &AppState) {
             "selection · c comment · y copy · esc clear · click elsewhere clears"
         }
         Mode::Normal => {
-            "j/k · ]/[ file · }/{ hunk · n next-reply · e tree · t pick · R threads · v viewed · y yank · c comment · S submit · ? help · q quit"
+            "j/k · ]/[ file · }/{ hunk · n next-reply · m mark-read · e tree · t pick · R threads · v viewed · y yank · c comment · S submit · ? help · q quit"
         }
         Mode::Composing => match state.composer_target {
             Some(ComposerTarget::EditThread(_)) => {
@@ -1687,6 +1687,8 @@ fn draw_help(f: &mut Frame, area: Rect) {
         Line::from("  , / .        decrease / increase tab width"),
         Line::from(""),
         Line::from("  r            toggle resolved (on a commented line)"),
+        Line::from("  m            mark thread read (silences the purple highlight"),
+        Line::from("               until a newer reply arrives)"),
         Line::from("  K / 0        add reaction / clear reactions (on a thread)"),
         Line::from("  V            cycle review verdict (comment / approve / request changes)"),
         Line::from(""),
