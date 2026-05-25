@@ -57,6 +57,7 @@ pub fn has_working_changes(root: &Path) -> Result<bool> {
 pub fn detect_source(root: &Path, override_range: Option<String>) -> Result<DiffSource> {
     if let Some(range) = override_range {
         let (base, head) = parse_range(&range)?;
+        let head = canonicalize_head(root, &head);
         return Ok(DiffSource::Branch { base, head });
     }
 
@@ -64,9 +65,24 @@ pub fn detect_source(root: &Path, override_range: Option<String>) -> Result<Diff
         return Ok(DiffSource::WorkingTree);
     }
 
-    let head = "HEAD".to_string();
+    let head = canonicalize_head(root, "HEAD");
     let base = resolve_base(root)?;
     Ok(DiffSource::Branch { base, head })
+}
+
+/// Resolve `HEAD` to the current branch name so the slug — and therefore the
+/// `.gitdiff/threads-*.json` filename — is the same whether the user typed
+/// `gitdiff` (auto-detect), `gitdiff upstream/master..HEAD`, or
+/// `gitdiff upstream/master..<branch>`. Without this, CLI writes under one
+/// slug and the TUI reads from another, hiding comments. Detached HEAD or
+/// any non-`HEAD` ref is left unchanged.
+fn canonicalize_head(root: &Path, head: &str) -> String {
+    if head == "HEAD" {
+        if let Some(branch) = current_branch(root) {
+            return branch;
+        }
+    }
+    head.to_string()
 }
 
 fn parse_range(s: &str) -> Result<(String, String)> {
