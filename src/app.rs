@@ -330,10 +330,11 @@ pub struct AppState {
     // `body_width` last used when computing `flat`. Drives a re-flatten on
     // resize so thread sub-row counts match the new wrap.
     pub flat_for_body_width: u16,
-    // mtime of REVIEW-*.md the last time we read or wrote it. The event loop
-    // polls this every tick and re-imports replies if the file has changed
-    // externally (e.g. an agent appended a `> [@...] ...` line).
-    pub last_review_mtime: Option<std::time::SystemTime>,
+    // mtime of `.gitdiff/threads-*.json` the last time we read or wrote it.
+    // The TUI's idle tick compares it against the file's current mtime and
+    // merges in fresh CLI writes (e.g. an agent ran `gitdiff reply` in
+    // another shell) when they differ.
+    pub last_threads_mtime: Option<std::time::SystemTime>,
     // Last reported mouse position. Drives hover tooltips on comment
     // timestamps. None until the user moves the mouse.
     pub hover_pos: Option<(u16, u16)>,
@@ -417,7 +418,7 @@ impl AppState {
             composer_rect: None,
             selection_menu_rect: None,
             flat_for_body_width: 0,
-            last_review_mtime: None,
+            last_threads_mtime: None,
             hover_pos: None,
             hover_regions: RefCell::new(Vec::new()),
             suppressed_disk_replies: HashSet::new(),

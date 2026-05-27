@@ -23,131 +23,6 @@ use std::io;
 use std::time::Duration;
 use tui_textarea::{CursorMove, TextArea};
 
-/// Body comparison used by every reply-dedupe path: ignores trailing
-/// whitespace so an in-memory body of "X\n" and its round-tripped form "X"
-/// (write_review's `r.body.lines()` drops the trailing newline) compare equal.
-/// Without this, dedupe missed and the same reply got re-appended on every
-/// REVIEW.md import.
-fn bodies_equivalent(a: &str, b: &str) -> bool {
-    a.trim_end() == b.trim_end()
-}
-
-/// True if `r` already exists in `replies` (matched on author + timestamp +
-/// body modulo trailing whitespace).
-fn reply_is_duplicate(replies: &[app::Reply], r: &app::Reply) -> bool {
-    replies.iter().any(|x| {
-        x.author == r.author
-            && x.created_at == r.created_at
-            && bodies_equivalent(&x.body, &r.body)
-    })
-}
-
-/// Heal duplicates produced by older builds: when two replies share author +
-/// timestamp and their bodies match after leading-whitespace + trailing-ws
-/// normalization, the second is the lossy roundtrip copy — drop it, keep the
-/// longer-bodied original.
-fn heal_lossy_roundtrip_dups(replies: &mut Vec<app::Reply>) {
-    fn normalize(b: &str) -> String {
-        b.lines()
-            .map(|l| l.trim_start())
-            .collect::<Vec<_>>()
-            .join("\n")
-            .trim_end()
-            .to_string()
-    }
-    let mut keep = vec![true; replies.len()];
-    for i in 0..replies.len() {
-        if !keep[i] {
-            continue;
-        }
-        for j in (i + 1)..replies.len() {
-            if !keep[j] {
-                continue;
-            }
-            let a = &replies[i];
-            let b = &replies[j];
-            if a.author != b.author || a.created_at != b.created_at {
-                continue;
-            }
-            if normalize(&a.body) != normalize(&b.body) {
-                continue;
-            }
-            // Same fingerprint after normalization → drop the shorter copy.
-            if a.body.len() >= b.body.len() {
-                keep[j] = false;
-            } else {
-                keep[i] = false;
-                break; // i is gone — outer loop will skip it
-            }
-        }
-    }
-    let mut idx = 0;
-    replies.retain(|_| {
-        let k = keep[idx];
-        idx += 1;
-        k
-    });
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use chrono::TimeZone;
-
-    fn reply(author: &str, ts_ns: u32, body: &str) -> app::Reply {
-        app::Reply {
-            author: author.to_string(),
-            body: body.to_string(),
-            created_at: chrono::Utc.timestamp_opt(1_700_000_000, ts_ns).unwrap(),
-        }
-    }
-
-    #[test]
-    fn dedupe_ignores_trailing_newline() {
-        assert!(bodies_equivalent("hello\n", "hello"));
-        assert!(bodies_equivalent("hello\n\n", "hello"));
-        assert!(bodies_equivalent("a\nb\n", "a\nb"));
-        assert!(!bodies_equivalent("a\nb", "a b"));
-    }
-
-    #[test]
-    fn heal_removes_leading_ws_stripped_copy() {
-        let original = "fn foo() {\n    let x = 1;\n}";
-        let stripped = "fn foo() {\nlet x = 1;\n}";
-        let mut replies = vec![
-            reply("claude-code", 1_000, original),
-            reply("you", 2_000, "human reply"),
-            reply("claude-code", 1_000, stripped),
-        ];
-        heal_lossy_roundtrip_dups(&mut replies);
-        assert_eq!(replies.len(), 2);
-        assert_eq!(replies[0].body, original); // longer body kept
-        assert_eq!(replies[1].author, "you");
-    }
-
-    #[test]
-    fn heal_removes_trailing_newline_copy() {
-        let mut replies = vec![
-            reply("a", 1_000, "X\n"),
-            reply("a", 1_000, "X"),
-        ];
-        heal_lossy_roundtrip_dups(&mut replies);
-        assert_eq!(replies.len(), 1);
-        assert_eq!(replies[0].body, "X\n"); // longer kept
-    }
-
-    #[test]
-    fn heal_keeps_distinct_replies() {
-        let mut replies = vec![
-            reply("a", 1_000, "first"),
-            reply("a", 2_000, "second"),
-            reply("a", 1_000, "different"), // same ts but different content
-        ];
-        heal_lossy_roundtrip_dups(&mut replies);
-        assert_eq!(replies.len(), 3);
-    }
-}
-
 fn main() -> Result<()> {
     // Parse argv with clap. Subcommands run inside `parse_and_dispatch` and
     // return `Ok(None)`; the no-subcommand path returns the parsed `Cli` so we
@@ -174,65 +49,6 @@ fn main() -> Result<()> {
             d.thread_id =
                 app::make_thread_id(&d.file_path, d.old_lineno, d.new_lineno, &d.created_at);
         }
-    }
-    // Merge any agent replies that have been added to the REVIEW-*.md file
-    // since the last submit. The JSON store is canonical, so we re-save once
-    // merged to make the imported replies durable.
-    let mut merged_any = false;
-    let review_p = review::review_path(&root, &source);
-    if review_p.exists() {
-        if let Ok(text) = std::fs::read_to_string(&review_p) {
-            let map = review::parse_review_replies(&text);
-            for d in threads.iter_mut() {
-                if let Some(import) = map.get(&d.thread_id) {
-                    for r in &import.replies {
-                        if !reply_is_duplicate(&d.replies, r) {
-                            d.replies.push(r.clone());
-                            merged_any = true;
-                        }
-                    }
-                    if import.resolved && !d.resolved {
-                        d.resolved = true;
-                        merged_any = true;
-                    }
-                }
-            }
-        }
-    }
-    // Cleanup pass for the duplicate-reply drift produced by older builds.
-    // Three passes per thread:
-    //   1. Collapse synthetic 'X\nX\n…' bodies. The old parser merged
-    //      consecutive '> [@a T] X' lines (same author+ts) into one
-    //      multi-line Reply body, and a duplicated line therefore became
-    //      'X\nX'. Only collapse when *every* line is identical so real
-    //      multi-line replies stay intact.
-    //   2. Dedup by (author, body, timestamp-truncated-to-seconds), keeping
-    //      the first (most-precise) occurrence. This catches the
-    //      microsecond-vs-second-precision drift from the old write_review.
-    //   3. Lossy-roundtrip dedup: drop replies whose body differs from an
-    //      earlier reply (same author+ts) only by leading-whitespace
-    //      stripping or trailing-newline loss. That's the dup pattern
-    //      pre-parse-fix builds produced when re-importing REVIEW.md.
-    let mut deduped_any = false;
-    for d in threads.iter_mut() {
-        let before = d.replies.len();
-        for r in d.replies.iter_mut() {
-            let lines: Vec<&str> = r.body.split('\n').collect();
-            if lines.len() > 1 && lines.iter().all(|l| *l == lines[0]) {
-                r.body = lines[0].to_string();
-            }
-        }
-        let mut seen: std::collections::HashSet<(String, String, i64)> =
-            std::collections::HashSet::new();
-        d.replies
-            .retain(|r| seen.insert((r.author.clone(), r.body.clone(), r.created_at.timestamp())));
-        heal_lossy_roundtrip_dups(&mut d.replies);
-        if d.replies.len() != before {
-            deduped_any = true;
-        }
-    }
-    if merged_any || deduped_any {
-        let _ = review::save_threads(&root, &source, &threads);
     }
     // Drift-resistant re-anchor: snap threads to the current line numbers
     // when the surrounding code has moved. Also backfills `anchor_content`
@@ -317,9 +133,11 @@ fn run_loop<B: ratatui::backend::Backend>(
         })?;
 
         if !event::poll(Duration::from_millis(250))? {
-            // Idle tick: pick up agent edits to REVIEW.md.
-            if poll_review_file(state, root) {
-                // The next iteration renders the imported replies.
+            // Idle tick: pick up CLI writes to the JSON thread store (e.g. an
+            // agent ran `gitdiff reply` in another shell). Self-writes are
+            // skipped via the cached mtime stamped by `stamp_threads_mtime`.
+            if poll_threads_file(state, root) {
+                // The next iteration renders the freshly merged threads.
             }
             continue;
         }
@@ -589,6 +407,14 @@ fn handle_normal(
             }
         }
         KeyCode::Char('S') => {
+            review::save_threads_merging(
+                root,
+                &state.source,
+                &mut state.threads,
+                &mut state.suppressed_disk_replies,
+                &mut state.suppressed_thread_ids,
+            )?;
+            stamp_threads_mtime(state, root);
             let p = review::write_review(
                 root,
                 &state.source,
@@ -598,14 +424,6 @@ fn handle_normal(
                 &state.threads,
                 state.verdict,
             )?;
-            review::save_threads_merging(
-                root,
-                &state.source,
-                &mut state.threads,
-                &mut state.suppressed_disk_replies,
-                &mut state.suppressed_thread_ids,
-            )?;
-            stamp_review_mtime(state, root);
             state.status = Some(format!("wrote {} ({})", p.display(), state.verdict.label()));
         }
         KeyCode::Char('r') => {
@@ -651,65 +469,64 @@ fn handle_normal(
     Ok(())
 }
 
-/// Re-imports replies from REVIEW-*.md when the file has been modified since
-/// we last touched it. Cheap: skipped entirely when the mtime hasn't changed.
-/// Self-writes don't trigger a re-import — `stamp_review_mtime` is called
-/// after every write_review to bring the cached mtime in sync.
-fn poll_review_file(state: &mut AppState, root: &std::path::Path) -> bool {
-    let p = review::review_path(root, &state.source);
+/// Reload the canonical JSON thread store when it changes on disk (typically
+/// because a CLI subcommand — `gitdiff reply`, `comment`, `resolve`, … — ran
+/// in another shell). The TUI's own writes are skipped: `stamp_threads_mtime`
+/// is called after every `save_threads_merging` to bring the cached mtime in
+/// sync, so the next idle tick sees a matching mtime and short-circuits.
+///
+/// Merging into the in-memory state goes through `save_threads_merging`, which
+/// honors the TUI's suppression sets (locally deleted threads / edited reply
+/// identities) so concurrent CLI writes don't resurrect anything the user just
+/// removed.
+fn poll_threads_file(state: &mut AppState, root: &std::path::Path) -> bool {
+    let p = review::threads_path(root, &state.source);
     let mtime = match std::fs::metadata(&p).and_then(|m| m.modified()) {
         Ok(t) => t,
         Err(_) => return false,
     };
-    if state.last_review_mtime == Some(mtime) {
+    if state.last_threads_mtime == Some(mtime) {
         return false;
     }
-    let prev = state.last_review_mtime.replace(mtime);
-    // First sighting (prev is None) just primes the cache — don't re-import
-    // the file we just loaded at startup.
+    let prev = state.last_threads_mtime.replace(mtime);
+    // First sighting just primes the cache — startup already loaded the file.
     if prev.is_none() {
         return false;
     }
-    let Ok(text) = std::fs::read_to_string(&p) else {
+    let before: usize = state.threads.iter().map(|t| t.replies.len()).sum::<usize>()
+        + state.threads.len();
+    if review::save_threads_merging(
+        root,
+        &state.source,
+        &mut state.threads,
+        &mut state.suppressed_disk_replies,
+        &mut state.suppressed_thread_ids,
+    )
+    .is_err()
+    {
         return false;
-    };
-    let map = review::parse_review_replies(&text);
-    let mut changed = false;
-    for d in state.threads.iter_mut() {
-        if let Some(import) = map.get(&d.thread_id) {
-            for r in &import.replies {
-                if !reply_is_duplicate(&d.replies, r) {
-                    d.replies.push(r.clone());
-                    changed = true;
-                }
-            }
-            if import.resolved && !d.resolved {
-                d.resolved = true;
-                changed = true;
-            }
-        }
     }
-    if changed {
-        let _ = review::save_threads_merging(
-            root,
-            &state.source,
-            &mut state.threads,
-            &mut state.suppressed_disk_replies,
-            &mut state.suppressed_thread_ids,
-        );
+    // Our own re-save bumped the mtime; refresh the cache so the next tick
+    // doesn't see it as a foreign write.
+    stamp_threads_mtime(state, root);
+    let after: usize = state.threads.iter().map(|t| t.replies.len()).sum::<usize>()
+        + state.threads.len();
+    if after != before {
         state.rebuild_flat();
-        state.status = Some("imported replies from REVIEW.md".into());
+        state.status = Some("merged updates from CLI".into());
+        true
+    } else {
+        false
     }
-    changed
 }
 
-/// Updates the cached REVIEW.md mtime to whatever the file currently shows.
-/// Call after any successful `write_review` so the next poll tick treats our
-/// own write as expected and doesn't re-import.
-fn stamp_review_mtime(state: &mut AppState, root: &std::path::Path) {
-    let p = review::review_path(root, &state.source);
+/// Updates the cached JSON-store mtime to whatever the file currently shows.
+/// Call after any successful `save_threads_merging` so the next poll tick
+/// treats our own write as expected and doesn't re-merge.
+fn stamp_threads_mtime(state: &mut AppState, root: &std::path::Path) {
+    let p = review::threads_path(root, &state.source);
     if let Ok(t) = std::fs::metadata(&p).and_then(|m| m.modified()) {
-        state.last_review_mtime = Some(t);
+        state.last_threads_mtime = Some(t);
     }
 }
 
@@ -1223,43 +1040,26 @@ fn handle_composing(
             if body.is_empty() {
                 state.status = Some("empty comment, cancelled".into());
             } else if state.save_composer(target, body) {
-                // Persist to the JSON store on every save so a crash before
-                // submit doesn't lose work.
+                // Persist to the canonical JSON store on every save so a
+                // crash before submit doesn't lose work, and so an agent
+                // tailing `gitdiff watch` in another shell sees the new
+                // reply on the next mtime tick.
                 let _ = review::save_threads_merging(
-            root,
-            &state.source,
-            &mut state.threads,
-            &mut state.suppressed_disk_replies,
-            &mut state.suppressed_thread_ids,
-        );
-                let is_reply = matches!(
-                    target,
-                    ComposerTarget::NewReply(_) | ComposerTarget::EditReply { .. }
+                    root,
+                    &state.source,
+                    &mut state.threads,
+                    &mut state.suppressed_disk_replies,
+                    &mut state.suppressed_thread_ids,
                 );
-                // Replies auto-flush to REVIEW.md so an agent watching the file
-                // sees them immediately — no need to wait for `S`.
-                let mut suffix = "press S to submit".to_string();
-                if is_reply {
-                    if let Ok(p) = review::write_review(
-                        root,
-                        &state.source,
-                        &state.source_label,
-                        base_sha,
-                        head_sha,
-                        &state.threads,
-                        state.verdict,
-                    ) {
-                        suffix = format!("REVIEW.md updated → {}", p.display());
-                        stamp_review_mtime(state, root);
-                    }
-                }
+                stamp_threads_mtime(state, root);
+                let _ = (base_sha, head_sha); // reserved for future render hooks
                 let msg = match target {
                     ComposerTarget::NewThread => "thread saved",
                     ComposerTarget::EditThread(_) => "comment edited",
                     ComposerTarget::EditReply { .. } => "reply edited",
                     ComposerTarget::NewReply(_) => "reply added",
                 };
-                state.status = Some(format!("{msg} ({suffix})"));
+                state.status = Some(format!("{msg} (press S to render REVIEW.md)"));
             }
             close_composer(state, composer);
         }
