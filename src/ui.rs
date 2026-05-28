@@ -1182,7 +1182,12 @@ fn render_thread_row(
             + pre.chars().count();
         let ts_len = ts.chars().count();
         register_timestamp_hover(state, screen_row, ts_col_start, ts_len, &d.created_at);
-        let title_suffix = format!("{pre}{ts}{post}");
+        let id_suffix = if d.thread_id.is_empty() {
+            String::new()
+        } else {
+            format!(" · {}", d.thread_id)
+        };
+        let title_suffix = format!("{pre}{ts}{id_suffix}{post}");
         let title_chars = title_prefix.chars().count()
             + status_txt.chars().count()
             + title_suffix.chars().count();
