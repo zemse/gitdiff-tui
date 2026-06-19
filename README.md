@@ -20,9 +20,13 @@ in a format a coding agent (or another human) can act on directly.
 - Per-file and per-hunk collapse/expand, with `expand 20 above`/`below` buttons
   to load more file context lazily.
 - Inline comments with a yellow-bordered composer: click a line (or press `c`)
-  to write markdown, click an existing comment to edit, `x` to delete.
+  to write markdown. Click an existing comment for an actions menu
+  (reply / edit, resolve, mark read, react, delete); `x` deletes from the diff.
 - Range comments via mouse drag or `V` (visual select), reactions (`K`),
-  resolve / unresolve (`r`).
+  resolve / unresolve (`r`). While editing a comment, `ctrl-r` hides (resolves)
+  it and `ctrl-d` deletes it.
+- Live re-render: edits and new commits to the reviewed code are picked up
+  automatically and re-rendered in place, keeping your scroll position.
 - Threads pane (`R`) listing every open comment; `S` submits all threads to
   `REVIEW.md`. Threads auto-persist to `.gitdiff/threads.json`.
 - Review verdict (`V` cycles: comment / approve / request changes) shown in
@@ -73,15 +77,26 @@ gitdiff reply <tid> --body ...             # reply to an existing thread
 gitdiff edit <tid> [--reply N] --body ...  # edit a thread body or its Nth reply
 gitdiff resolve <tid> | reopen <tid>       # toggle resolved
 gitdiff delete <tid> [--reply N]           # delete a thread or just one reply
+gitdiff watch [<range>] [--author you] [--json]   # stream thread activity
 ```
 
 Body input takes `--body <text>`, `--body-file <path>`, or `--body-stdin`
 (read from stdin). Thread ids accept any unique prefix (git SHA-style).
-Agents should pass `--author claude-code` (or their handle); the human
-reviewer then sees the thread highlighted as "awaiting your reply" in the
-TUI. Run `gitdiff --help` (or `gitdiff <subcommand> --help`) for the full
+`comment` and `reply` default to `--author agent`, so an agent's writes are
+never mis-attributed to the human; the human reviewer then sees the thread
+highlighted as "awaiting your reply" in the TUI. Pass `--author claude-code`
+(or your own handle) to be specific, or `--author you` when a human drives the
+CLI. Run `gitdiff --help` (or `gitdiff <subcommand> --help`) for the full
 clap-generated reference plus a live "what diff would I auto-detect right
 now" trailer.
+
+`gitdiff watch` streams thread activity for an agent to react to. It opens
+with a `system` event (response etiquette — don't reply unless you have
+something concrete and important to say) and one `awaiting_response` event per
+thread still owed an agent reply, then streams deltas; every event carries an
+`awaiting_response` boolean. Use `--author you` to follow human activity (new
+threads, replies, and the awaiting-response backlog) without seeing the
+agent's own writes.
 
 Example agent loop:
 
@@ -126,9 +141,12 @@ Keybindings
 
   c            add / edit comment on current line
   x            delete comment on current line
+  ctrl-r       hide (resolve) comment from the composer
+  ctrl-d       delete comment from the composer
   S            submit threads → REVIEW.md at repo root
 
   mouse        click to move cursor, click header to collapse, wheel to scroll
+               click a comment → actions menu (reply / resolve / delete / …)
 
   ?            toggle this help
   q            quit (threads auto-persist to .gitdiff/threads.json)

@@ -125,6 +125,7 @@ pub fn draw(f: &mut Frame, state: &mut AppState, composer: Option<&mut TextArea<
     // Stale by default; the composer/menu draw paths below populate when shown.
     state.composer_rect = None;
     state.selection_menu_rect = None;
+    state.thread_menu_rect = None;
 
     if state.mode == Mode::Composing {
         if let Some(ta) = composer {
@@ -136,6 +137,10 @@ pub fn draw(f: &mut Frame, state: &mut AppState, composer: Option<&mut TextArea<
         draw_help(f, area);
     } else if state.mode == Mode::Picker {
         draw_picker(f, area, state);
+    } else if state.mode == Mode::ThreadMenu {
+        if let Some(rect) = draw_thread_menu(f, body_area, state) {
+            state.thread_menu_rect = Some((rect.x, rect.y, rect.width, rect.height));
+        }
     } else if state.mode == Mode::Normal {
         // Floating [copy] [comment] menu for a finished drag selection.
         if let Some(sel) = state.selection {
@@ -505,12 +510,16 @@ fn draw_footer(f: &mut Frame, area: Rect, state: &AppState) {
         }
         Mode::Composing => match state.composer_target {
             Some(ComposerTarget::EditThread(_)) => {
-                "enter save · shift-enter newline · ctrl-d delete · esc cancel"
+                "enter save · shift-enter newline · ctrl-r hide · ctrl-d delete · esc cancel"
+            }
+            Some(ComposerTarget::NewReply(_) | ComposerTarget::EditReply { .. }) => {
+                "enter save · shift-enter newline · ctrl-r hide · esc cancel"
             }
             _ => "enter save · shift-enter newline · esc cancel",
         },
         Mode::Help => "any key to close help",
         Mode::Picker => "type to filter · ↑↓ select · enter jump · esc cancel",
+        Mode::ThreadMenu => "↑↓ select · enter choose · esc / click-away close",
     };
     let status = state.status.clone().unwrap_or_default();
     let line = Line::from(vec![
@@ -722,6 +731,93 @@ fn draw_selection_menu(f: &mut Frame, body: Rect, state: &AppState) -> Option<Re
     let para = Paragraph::new(Line::from(spans));
     f.render_widget(para, rect);
     Some(rect)
+}
+
+/// Draw the floating thread context menu (reply / resolve / mark read / react /
+/// delete) anchored to the clicked thread row. Returns its rect so the caller
+/// can store it for hit-testing.
+fn draw_thread_menu(f: &mut Frame, body: Rect, state: &AppState) -> Option<Rect> {
+    let menu = state.thread_menu.as_ref()?;
+    let items = state.thread_menu_items(menu.thread_idx);
+    if items.is_empty() {
+        return None;
+    }
+    let label_w = items
+        .iter()
+        .map(|(l, _)| l.chars().count())
+        .max()
+        .unwrap_or(4);
+    // 1 space of padding on each side of the label, inside the border.
+    let inner_w = (label_w + 2) as u16;
+    let w = (inner_w + 2).min(body.width);
+    let h = (items.len() as u16 + 2).min(body.height);
+    // Prefer one row below the clicked thread row; flip above if it would spill
+    // past the bottom of the body.
+    let anchor_rel = menu.anchor_flat_idx.saturating_sub(state.scroll) as u16;
+    let body_bottom = body.y + body.height;
+    let below_y = body.y.saturating_add(anchor_rel).saturating_add(1);
+    let y = if below_y + h <= body_bottom {
+        below_y
+    } else {
+        body.y.saturating_add(anchor_rel).saturating_sub(h)
+    };
+    let y = y.clamp(body.y, body_bottom.saturating_sub(h));
+    let x = (body.x + 2).min(body.x + body.width.saturating_sub(w));
+    let rect = Rect {
+        x,
+        y,
+        width: w,
+        height: h,
+    };
+
+    f.render_widget(Clear, rect);
+    let bg = Color::Rgb(40, 50, 70);
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .title(" thread ")
+        .border_style(Style::default().fg(Color::Yellow).bg(bg))
+        .style(Style::default().bg(bg));
+    let inner = block.inner(rect);
+    f.render_widget(block, rect);
+
+    for (i, (label, _)) in items.iter().enumerate() {
+        if i as u16 >= inner.height {
+            break;
+        }
+        let row = Rect {
+            x: inner.x,
+            y: inner.y + i as u16,
+            width: inner.width,
+            height: 1,
+        };
+        let selected = i == menu.cursor;
+        let style = if selected {
+            Style::default()
+                .fg(Color::Black)
+                .bg(Color::Yellow)
+                .add_modifier(Modifier::BOLD)
+        } else {
+            Style::default().fg(Color::Rgb(220, 230, 245)).bg(bg)
+        };
+        let para =
+            Paragraph::new(Line::from(Span::styled(format!(" {label}"), style))).style(style);
+        f.render_widget(para, row);
+    }
+    Some(rect)
+}
+
+/// Maps a screen click to a thread-menu item index, if the click landed inside
+/// the menu's content area.
+pub fn thread_menu_item_at(state: &AppState, col: u16, row: u16) -> Option<usize> {
+    let (mx, my, mw, mh) = state.thread_menu_rect?;
+    // Exclude the 1-cell border on each edge.
+    if col <= mx || col + 1 >= mx + mw || row <= my || row + 1 >= my + mh {
+        return None;
+    }
+    let idx = (row - my - 1) as usize;
+    let menu = state.thread_menu.as_ref()?;
+    let count = state.thread_menu_items(menu.thread_idx).len();
+    (idx < count).then_some(idx)
 }
 
 /// Returns (extended_position, height) of the composer-induced gap.
@@ -1702,6 +1798,7 @@ fn draw_help(f: &mut Frame, area: Rect) {
         Line::from("  shift-enter  insert newline (composer)"),
         Line::from("  n            jump to next thread where last reply isn't yours"),
         Line::from("  x            delete comment on current line"),
+        Line::from("  ctrl-r       hide (resolve) comment from edit mode (in composer)"),
         Line::from("  ctrl-d       delete comment from edit mode (in composer)"),
         Line::from("  S            submit threads → REVIEW.md at repo root"),
         Line::from("               (agents may reply inside <!-- replies:tID --> blocks;"),
@@ -1710,6 +1807,7 @@ fn draw_help(f: &mut Frame, area: Rect) {
         Line::from(
             "  mouse        click to move cursor, click header to collapse, wheel to scroll",
         ),
+        Line::from("               click a comment → actions menu (reply / resolve / delete / …)"),
         Line::from(""),
         Line::from("  ?            toggle this help"),
         Line::from("  q            quit (threads auto-persist to .gitdiff/threads.json)"),

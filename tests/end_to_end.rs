@@ -51,6 +51,47 @@ fn working_tree_diff_parses_and_writes_review() {
 }
 
 #[test]
+fn working_tree_diff_includes_untracked_files() {
+    let tmp = tempdir_in_target("gitdiff_e2e_untracked");
+    git(&tmp, &["init", "-q", "-b", "main"]);
+    git(&tmp, &["config", "user.email", "t@t"]);
+    git(&tmp, &["config", "user.name", "t"]);
+
+    fs::write(tmp.join("tracked.rs"), "fn main() {}\n").unwrap();
+    git(&tmp, &["add", "tracked.rs"]);
+    git(&tmp, &["commit", "-q", "-m", "init"]);
+
+    // A brand-new, never-added file plus an ignored one that must NOT show up.
+    fs::write(tmp.join("fresh.rs"), "fn brand_new() {}\n").unwrap();
+    fs::write(tmp.join(".gitignore"), "ignored.rs\n").unwrap();
+    fs::write(tmp.join("ignored.rs"), "should not appear\n").unwrap();
+
+    let out = Command::new(env!("CARGO_BIN_EXE_gitdiff"))
+        .arg("diff")
+        .current_dir(&tmp)
+        .output()
+        .expect("run gitdiff diff");
+    assert!(
+        out.status.success(),
+        "gitdiff diff failed: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let raw = String::from_utf8(out.stdout).unwrap();
+    assert!(
+        raw.contains("diff --git a/fresh.rs b/fresh.rs") && raw.contains("+fn brand_new() {}"),
+        "untracked file missing from diff:\n{raw}"
+    );
+    assert!(
+        raw.contains("new file mode"),
+        "untracked file not rendered as a new file:\n{raw}"
+    );
+    assert!(
+        !raw.contains("should not appear"),
+        "gitignored file leaked into diff:\n{raw}"
+    );
+}
+
+#[test]
 fn branch_diff_against_upstream() {
     let tmp = tempdir_in_target("gitdiff_e2e_br");
     git(&tmp, &["init", "-q", "-b", "main"]);

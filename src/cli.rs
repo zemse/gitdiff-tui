@@ -12,7 +12,9 @@ use chrono::Utc;
 use clap::{Args, CommandFactory, Parser, Subcommand};
 use std::path::PathBuf;
 
-use crate::app::{LOCAL_AUTHOR, Reply, Thread, make_thread_id};
+use crate::app::{
+    AGENT_AUTHOR, LOCAL_AUTHOR, Reply, Thread, awaiting_agent_response, make_thread_id,
+};
 use crate::diff::{self, FileDiff, LineKind};
 use crate::git::{self, DiffOpts, DiffSource};
 use crate::review;
@@ -90,9 +92,10 @@ pub enum Commands {
         side: String,
         #[command(flatten)]
         body: BodyInput,
-        /// Author handle (default `you`). Agents pass `claude-code`,
-        /// `codex`, `gemini`, …
-        #[arg(long, default_value_t = LOCAL_AUTHOR.to_string())]
+        /// Author handle (default `agent`). Agents may pass a specific name
+        /// like `claude-code`, `codex`, `gemini`; a human driving the CLI
+        /// passes `--author you`.
+        #[arg(long, default_value_t = AGENT_AUTHOR.to_string())]
         author: String,
     },
 
@@ -104,8 +107,9 @@ pub enum Commands {
         range: Option<String>,
         #[command(flatten)]
         body: BodyInput,
-        /// Author handle (default `you`).
-        #[arg(long, default_value_t = LOCAL_AUTHOR.to_string())]
+        /// Author handle (default `agent`). A human driving the CLI passes
+        /// `--author you`.
+        #[arg(long, default_value_t = AGENT_AUTHOR.to_string())]
         author: String,
     },
 
@@ -153,16 +157,20 @@ pub enum Commands {
     /// changes. Lets an agent react to each human reply the moment it lands
     /// instead of polling or waiting for a batch.
     ///
-    /// Existing content is *not* re-emitted at startup; only deltas. Use
-    /// `gitdiff list` first if you need a baseline.
+    /// At startup it emits a `system` event (response etiquette for the agent)
+    /// followed by an `awaiting_response` event for every thread still owed an
+    /// agent reply (the human spoke last, unresolved) — this *is* the backlog,
+    /// so you don't need `gitdiff list` first. After that, only deltas. Every
+    /// event carries an `awaiting_response` boolean.
     ///
     /// Exits on Ctrl-C. Stdout is line-flushed so a pipeline reader sees
     /// each event immediately.
     Watch {
         /// Optional `<base>..<head>` range; auto-detected if absent.
         range: Option<String>,
-        /// Only emit events whose author matches (e.g. `--author you` to
-        /// watch human replies and skip the agent's own writes).
+        /// Only emit events whose author matches. `--author you` watches human
+        /// activity (replies + brand-new threads + the awaiting-response
+        /// backlog) and skips the agent's own writes.
         #[arg(long)]
         author: Option<String>,
         /// Poll interval in milliseconds. Lower = snappier, higher = cheaper.
@@ -469,7 +477,7 @@ fn cmd_comment(
         (body.clone(), Vec::new())
     } else {
         (
-            format!("(agent {author} opened this thread)"),
+            format!("(@{author} opened this thread)"),
             vec![Reply {
                 author: author.clone(),
                 body,
@@ -601,6 +609,25 @@ fn cmd_delete(thread_id: String, range: Option<String>, reply: Option<usize>) ->
 ///   - Author filter is matched verbatim. Pass `--author you` to watch
 ///     only human messages; the agent's own replies (`--author claude-code`,
 ///     etc.) are skipped.
+/// Response etiquette emitted to the agent at the start of every `watch`
+/// stream. Keeps agents from spamming threads with low-value acknowledgements.
+const WATCH_AGENT_PROMPT: &str = "You are watching review threads. Reply to a thread ONLY when you have something concrete and genuinely important to add — a real answer, a decision, a substantive update, or a necessary question. If your reply would just be a simple affirmation (\"ok\", \"done\", \"got it\", \"sounds good\"), do NOT reply at all. Silence is the correct response when nothing important needs saying.";
+
+fn emit_system_prompt(out: &mut impl std::io::Write, as_json: bool) -> Result<()> {
+    if as_json {
+        let obj = serde_json::json!({ "event": "system", "prompt": WATCH_AGENT_PROMPT });
+        writeln!(out, "{obj}")?;
+    } else {
+        writeln!(out, "[system] {WATCH_AGENT_PROMPT}")?;
+    }
+    Ok(())
+}
+
+/// True when `author` should pass `filter` (None = no filter = everything).
+fn author_passes(filter: Option<&str>, author: &str) -> bool {
+    filter.map(|f| f == author).unwrap_or(true)
+}
+
 fn cmd_watch(
     range: Option<String>,
     author_filter: Option<String>,
@@ -645,6 +672,26 @@ fn cmd_watch(
 
     let interval = Duration::from_millis(interval_ms.max(50));
     let stdout = std::io::stdout();
+
+    // Lead with the response-etiquette system prompt, then surface the current
+    // backlog of threads still awaiting an agent response (the human spoke
+    // last, unresolved). These predate the watch, so the delta loop below
+    // would never emit them — but they're exactly what the agent needs to act
+    // on. Skipped when the filter excludes the human's messages.
+    {
+        let mut out = stdout.lock();
+        emit_system_prompt(&mut out, as_json)?;
+        if author_passes(author_filter.as_deref(), LOCAL_AUTHOR) {
+            for t in &baseline {
+                if awaiting_agent_response(t) {
+                    let last = t.replies.iter().enumerate().last();
+                    emit_event(&mut out, as_json, "awaiting_response", t, last)?;
+                }
+            }
+        }
+        let _ = out.flush();
+    }
+
     let mut last_mtime: Option<std::time::SystemTime> = std::fs::metadata(&threads_p)
         .and_then(|m| m.modified())
         .ok();
@@ -670,10 +717,18 @@ fn cmd_watch(
 
         let mut out = stdout.lock();
         for t in &threads {
-            if seen_threads.insert(t.thread_id.clone())
-                && author_filter.is_none()
-            {
-                emit_event(&mut out, as_json, "new_thread", t, None)?;
+            if seen_threads.insert(t.thread_id.clone()) {
+                // Unfiltered: every new thread. Filtered: only emit a new
+                // thread the human just opened (no agent reply seeded yet) when
+                // watching `--author you`, so an agent's human-activity stream
+                // doesn't miss brand-new threads awaiting its response.
+                let emit_new_thread = match author_filter.as_deref() {
+                    None => true,
+                    Some(f) => f == LOCAL_AUTHOR && t.replies.is_empty(),
+                };
+                if emit_new_thread {
+                    emit_event(&mut out, as_json, "new_thread", t, None)?;
+                }
             }
             for (i, r) in t.replies.iter().enumerate() {
                 if !seen_replies.insert(rkey(&t.thread_id, r)) {
@@ -687,10 +742,7 @@ fn cmd_watch(
                     emit_event(&mut out, as_json, "new_reply", t, Some((i, r)))?;
                 }
             }
-            if t.resolved
-                && seen_resolved.insert(t.thread_id.clone())
-                && author_filter.is_none()
-            {
+            if t.resolved && seen_resolved.insert(t.thread_id.clone()) && author_filter.is_none() {
                 emit_event(&mut out, as_json, "resolved", t, None)?;
             }
         }
@@ -711,6 +763,7 @@ fn emit_event(
             "thread_id": t.thread_id,
             "file": t.file_path,
             "anchor": t.anchor_label(),
+            "awaiting_response": awaiting_agent_response(t),
         });
         if t.resolved {
             obj["resolved"] = serde_json::Value::Bool(true);
@@ -718,14 +771,20 @@ fn emit_event(
         if let Some((idx, r)) = reply {
             obj["reply_index"] = serde_json::json!(idx);
             obj["author"] = serde_json::json!(r.author);
-            obj["created_at"] = serde_json::json!(
-                r.created_at.format("%Y-%m-%dT%H:%M:%SZ").to_string()
-            );
+            obj["created_at"] =
+                serde_json::json!(r.created_at.format("%Y-%m-%dT%H:%M:%SZ").to_string());
             obj["body"] = serde_json::json!(r.body);
         }
         writeln!(out, "{obj}")?;
     } else {
         let ts = chrono::Utc::now().format("%H:%M:%S");
+        // Flag threads the agent still owes a reply on so a human tailing the
+        // stream can see the backlog at a glance.
+        let flag = if awaiting_agent_response(t) {
+            " ⟵ awaiting agent reply"
+        } else {
+            ""
+        };
         match reply {
             Some((i, r)) => {
                 let preview: String = r
@@ -738,7 +797,7 @@ fn emit_event(
                     .collect();
                 writeln!(
                     out,
-                    "[{ts}] {event} {tid} {file}:{anchor} reply#{i} @{author}\n    {preview}",
+                    "[{ts}] {event} {tid} {file}:{anchor} reply#{i} @{author}{flag}\n    {preview}",
                     tid = t.thread_id,
                     file = t.file_path,
                     anchor = t.anchor_label(),
@@ -756,7 +815,7 @@ fn emit_event(
                     .collect();
                 writeln!(
                     out,
-                    "[{ts}] {event} {tid} {file}:{anchor}\n    {preview}",
+                    "[{ts}] {event} {tid} {file}:{anchor}{flag}\n    {preview}",
                     tid = t.thread_id,
                     file = t.file_path,
                     anchor = t.anchor_label(),

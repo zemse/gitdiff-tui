@@ -89,6 +89,14 @@ pub const REACTION_CYCLE: &[&str] = &["👍", "👎", "🎉", "😄", "❤️", 
 /// Agents are instructed not to claim this name when replying.
 pub const LOCAL_AUTHOR: &str = "you";
 
+/// Default author for messages written through the CLI (`gitdiff comment`,
+/// `gitdiff reply`). The CLI is the agent's entry point, so its writes default
+/// to this rather than `LOCAL_AUTHOR` — otherwise an agent reply lands under
+/// the human's identity and `needs_attention` wrongly treats the thread as
+/// already answered, suppressing the "awaiting your reply" highlight. A human
+/// driving the CLI can still pass `--author you`.
+pub const AGENT_AUTHOR: &str = "agent";
+
 /// A thread "needs your attention" when it's still open and the last message
 /// in the conversation isn't yours — i.e. an agent (or someone else) replied
 /// and you haven't responded. Acknowledging the thread (`m`) silences the
@@ -108,6 +116,23 @@ pub fn needs_attention(d: &Thread) -> bool {
         Some(ack) if ack >= last.created_at => false,
         _ => true,
     }
+}
+
+/// Whether the human (`you`) authored the thread's last message. The original
+/// post counts as the human's unless an agent opened the thread via the CLI
+/// (which seeds an agent reply, see `cmd_comment`).
+pub fn last_message_is_human(d: &Thread) -> bool {
+    match d.replies.last() {
+        Some(r) => r.author == LOCAL_AUTHOR,
+        None => true,
+    }
+}
+
+/// A thread is "awaiting an agent response" when it's unresolved and the human
+/// spoke last — the mirror of `needs_attention` (which is from the human's
+/// side). `gitdiff watch` surfaces these so an agent knows its backlog.
+pub fn awaiting_agent_response(d: &Thread) -> bool {
+    !d.resolved && last_message_is_human(d)
 }
 
 /// What the composer is operating on. The thread editing rules are:
@@ -137,6 +162,51 @@ impl ComposerTarget {
             _ => None,
         }
     }
+
+    /// The existing thread this composer is attached to, if any. `NewThread`
+    /// has none (the thread isn't saved yet); every other variant edits or
+    /// replies to a thread already in `state.threads`.
+    pub fn thread_idx(&self) -> Option<usize> {
+        match self {
+            ComposerTarget::NewThread => None,
+            ComposerTarget::EditThread(idx)
+            | ComposerTarget::NewReply(idx)
+            | ComposerTarget::EditReply {
+                thread_idx: idx, ..
+            } => Some(*idx),
+        }
+    }
+}
+
+/// An entry in the thread context menu. The exact set shown depends on the
+/// thread's state (see `AppState::thread_menu_items`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ThreadMenuAction {
+    /// Open the composer to reply to / edit the thread (the old click action).
+    Reply,
+    /// Hide the thread from the inline diff by resolving it.
+    Resolve,
+    /// Un-resolve a previously-resolved thread.
+    Reopen,
+    /// Silence the "awaiting your reply" highlight.
+    MarkRead,
+    /// Re-arm the highlight after a mark-read.
+    MarkUnread,
+    /// Add the next reaction emoji.
+    React,
+    /// Delete the whole thread.
+    Delete,
+}
+
+/// State for the floating thread context menu opened on a thread click.
+#[derive(Debug, Clone)]
+pub struct ThreadMenu {
+    /// Index into `state.threads` the menu acts on.
+    pub thread_idx: usize,
+    /// Flat-row index the menu is anchored below (the clicked thread row).
+    pub anchor_flat_idx: usize,
+    /// Highlighted item for keyboard navigation.
+    pub cursor: usize,
 }
 
 impl Thread {
@@ -158,6 +228,17 @@ impl Thread {
             _ => "L?".to_string(),
         }
     }
+}
+
+/// A diff-reload-stable handle to a flat row. Captured before `replace_files`
+/// re-flattens and resolved against the new `flat` afterwards so scroll/cursor
+/// stay pinned to the same code. See `AppState::row_anchor`.
+#[derive(Clone)]
+struct RowAnchor {
+    path: String,
+    old: Option<usize>,
+    new: Option<usize>,
+    kind: FlatKind,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -183,6 +264,10 @@ pub enum Mode {
     Composing,
     Help,
     Picker,
+    /// A context menu (reply / resolve / mark read / react / delete) floating
+    /// over a thread the user clicked. Replaces the old "click goes straight
+    /// into the composer" behavior.
+    ThreadMenu,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -335,6 +420,16 @@ pub struct AppState {
     // merges in fresh CLI writes (e.g. an agent ran `gitdiff reply` in
     // another shell) when they differ.
     pub last_threads_mtime: Option<std::time::SystemTime>,
+    // Hash of the raw diff the last time we (re)loaded it. The idle tick
+    // recomputes the diff's hash and, when it differs, reloads files in place
+    // so edits/commits to the reviewed code re-render without restarting. None
+    // until the first poll primes it.
+    pub last_diff_fingerprint: Option<u64>,
+    // The floating thread context menu, when open (Mode::ThreadMenu).
+    pub thread_menu: Option<ThreadMenu>,
+    // Geometry (x, y, w, h) of the thread menu as drawn last frame, for
+    // hit-testing clicks on its items and detecting clicks outside it.
+    pub thread_menu_rect: Option<(u16, u16, u16, u16)>,
     // Last reported mouse position. Drives hover tooltips on comment
     // timestamps. None until the user moves the mouse.
     pub hover_pos: Option<(u16, u16)>,
@@ -419,6 +514,9 @@ impl AppState {
             selection_menu_rect: None,
             flat_for_body_width: 0,
             last_threads_mtime: None,
+            last_diff_fingerprint: None,
+            thread_menu: None,
+            thread_menu_rect: None,
             hover_pos: None,
             hover_regions: RefCell::new(Vec::new()),
             suppressed_disk_replies: HashSet::new(),
@@ -895,7 +993,65 @@ impl AppState {
         added
     }
 
+    /// A stable handle to a flat row that survives a diff reload: the file it
+    /// belongs to plus, for code rows, the (old, new) line numbers. Used to
+    /// keep the viewport pinned to the same code when `replace_files`
+    /// re-flattens after the underlying diff changed.
+    fn row_anchor(&self, idx: usize) -> Option<RowAnchor> {
+        let fl = self.flat.get(idx)?;
+        let path = self.files.get(fl.file_idx)?.path.clone();
+        let (old, new) = if fl.kind == FlatKind::Code {
+            let line = self.files[fl.file_idx]
+                .hunks
+                .get(fl.hunk_idx?)?
+                .lines
+                .get(fl.line_idx?)?;
+            (line.old_lineno, line.new_lineno)
+        } else {
+            (None, None)
+        };
+        Some(RowAnchor {
+            path,
+            old,
+            new,
+            kind: fl.kind,
+        })
+    }
+
+    /// Find the flat index that best matches a previously-captured anchor in
+    /// the freshly rebuilt `flat`. Returns None if the file or line vanished.
+    fn find_row_anchor(&self, a: &RowAnchor) -> Option<usize> {
+        let fi = self.files.iter().position(|f| f.path == a.path)?;
+        if a.kind == FlatKind::Code {
+            self.flat.iter().position(|fl| {
+                if fl.file_idx != fi || fl.kind != FlatKind::Code {
+                    return false;
+                }
+                let (Some(hi), Some(li)) = (fl.hunk_idx, fl.line_idx) else {
+                    return false;
+                };
+                self.files[fi]
+                    .hunks
+                    .get(hi)
+                    .and_then(|h| h.lines.get(li))
+                    .is_some_and(|l| l.old_lineno == a.old && l.new_lineno == a.new)
+            })
+        } else {
+            self.flat
+                .iter()
+                .position(|fl| fl.file_idx == fi && fl.kind == a.kind)
+        }
+    }
+
     pub fn replace_files(&mut self, files: Vec<FileDiff>) {
+        // Capture where the viewport and cursor are pinned *before* we drop the
+        // old flat, so we can restore them to the same code afterwards even
+        // when line numbers shifted. Keeping the cursor's on-screen row lets us
+        // fall back gracefully when its exact line was deleted.
+        let scroll_anchor = self.row_anchor(self.scroll);
+        let cursor_anchor = self.row_anchor(self.cursor);
+        let cursor_row = self.cursor.saturating_sub(self.scroll);
+
         let expanded: Vec<bool> = files
             .iter()
             .map(|f| !self.viewed.contains_key(&f.path))
@@ -914,10 +1070,26 @@ impl AppState {
         self.total_additions = total_additions;
         self.total_deletions = total_deletions;
         self.rebuild_flat();
-        self.cursor = self.cursor.min(self.flat.len().saturating_sub(1));
-        self.scroll = self.scroll.min(self.flat.len().saturating_sub(1));
+        let last = self.flat.len().saturating_sub(1);
+        // Restore the viewport to the same code it was showing. We deliberately
+        // do NOT call ensure_cursor_visible here: the scroll offset is pinned
+        // to its anchor so a live reload doesn't yank the view to chase the
+        // cursor — preserving the scroll position is the whole point.
+        self.scroll = scroll_anchor
+            .and_then(|a| self.find_row_anchor(&a))
+            .unwrap_or_else(|| self.scroll.min(last));
+        self.cursor = cursor_anchor
+            .and_then(|a| self.find_row_anchor(&a))
+            .unwrap_or_else(|| (self.scroll + cursor_row).min(last));
+        self.clamp_scroll();
         self.clear_selection();
-        self.ensure_cursor_visible();
+    }
+
+    /// Clamp `scroll` to the valid range without moving it to follow the
+    /// cursor. Used by reloads that want to keep the viewport pinned.
+    fn clamp_scroll(&mut self) {
+        let max_scroll = self.flat.len().saturating_sub(self.viewport_height.max(1));
+        self.scroll = self.scroll.min(max_scroll);
     }
 
     pub fn jump_to_file(&mut self, file_idx: usize) {
@@ -1187,7 +1359,12 @@ impl AppState {
         let file = self.files.get(fi)?;
         let line = file.hunks.get(hi)?.lines.get(li)?;
         self.threads.iter().position(|d| {
-            d.file_path == file.path
+            // Skip resolved threads: they're hidden from the inline diff, so a
+            // comment on their old line is a brand-new thread, not an edit of
+            // the hidden one (otherwise the "new" comment inherits `resolved`
+            // and is invisible too).
+            !d.resolved
+                && d.file_path == file.path
                 && d.new_lineno == line.new_lineno
                 && d.old_lineno == line.old_lineno
         })
@@ -1376,8 +1553,13 @@ impl AppState {
             None
         };
 
+        // Only fold into an existing *open* thread on this line. A resolved
+        // thread is hidden, so overwriting it would make the new comment
+        // inherit `resolved` and vanish — match the renderer/selection logic
+        // and start a fresh thread instead.
         if let Some(idx) = self.threads.iter().position(|d| {
-            d.file_path == file.path
+            !d.resolved
+                && d.file_path == file.path
                 && d.new_lineno == last_line.new_lineno
                 && d.old_lineno == last_line.old_lineno
         }) {
@@ -1418,15 +1600,7 @@ impl AppState {
 
     pub fn add_reaction_at_cursor(&mut self) -> Option<String> {
         let idx = self.thread_for_cursor()?;
-        let used: HashSet<&String> = self.threads[idx].reactions.iter().collect();
-        // pick the first reaction not yet present
-        let pick = REACTION_CYCLE
-            .iter()
-            .find(|r| !used.contains(&r.to_string()))
-            .copied()
-            .unwrap_or(REACTION_CYCLE[0]);
-        self.threads[idx].reactions.push(pick.to_string());
-        Some(pick.to_string())
+        self.add_reaction(idx)
     }
 
     pub fn clear_reactions_at_cursor(&mut self) -> bool {
@@ -1451,19 +1625,7 @@ impl AppState {
     /// is already yours is a no-op — there was nothing to silence.
     pub fn toggle_acknowledged_at_cursor(&mut self) -> Option<bool> {
         let idx = self.thread_for_cursor()?;
-        let d = &mut self.threads[idx];
-        let last = d.replies.last()?;
-        if last.author == LOCAL_AUTHOR {
-            return None;
-        }
-        let last_ts = last.created_at;
-        if matches!(d.acknowledged_at, Some(ack) if ack >= last_ts) {
-            d.acknowledged_at = None;
-            Some(false)
-        } else {
-            d.acknowledged_at = Some(Utc::now());
-            Some(true)
-        }
+        self.toggle_acknowledged(idx)
     }
 
     pub fn mark_outdated_threads(&mut self) {
@@ -1484,13 +1646,81 @@ impl AppState {
 
     pub fn delete_thread_at_cursor(&mut self) -> bool {
         if let Some(idx) = self.thread_for_cursor() {
-            self.suppressed_thread_ids
-                .insert(self.threads[idx].thread_id.clone());
-            self.threads.remove(idx);
+            self.delete_thread(idx);
             true
         } else {
             false
         }
+    }
+
+    /// Delete the thread at `ti`, recording its id in the suppression set so a
+    /// concurrent CLI write doesn't resurrect it on the next merge.
+    pub fn delete_thread(&mut self, ti: usize) {
+        if let Some(d) = self.threads.get(ti) {
+            self.suppressed_thread_ids.insert(d.thread_id.clone());
+            self.threads.remove(ti);
+        }
+    }
+
+    /// Set the resolved flag on the thread at `ti`. Returns the new value.
+    pub fn set_resolved(&mut self, ti: usize, resolved: bool) -> Option<bool> {
+        let d = self.threads.get_mut(ti)?;
+        d.resolved = resolved;
+        Some(resolved)
+    }
+
+    /// Toggle "I've seen this" on the thread at `ti` (index variant of
+    /// `toggle_acknowledged_at_cursor`). See that method for semantics.
+    pub fn toggle_acknowledged(&mut self, ti: usize) -> Option<bool> {
+        let d = self.threads.get_mut(ti)?;
+        let last = d.replies.last()?;
+        if last.author == LOCAL_AUTHOR {
+            return None;
+        }
+        let last_ts = last.created_at;
+        if matches!(d.acknowledged_at, Some(ack) if ack >= last_ts) {
+            d.acknowledged_at = None;
+            Some(false)
+        } else {
+            d.acknowledged_at = Some(Utc::now());
+            Some(true)
+        }
+    }
+
+    /// Add the next unused reaction emoji to the thread at `ti`.
+    pub fn add_reaction(&mut self, ti: usize) -> Option<String> {
+        let used: HashSet<&String> = self.threads.get(ti)?.reactions.iter().collect();
+        let pick = REACTION_CYCLE
+            .iter()
+            .find(|r| !used.contains(&r.to_string()))
+            .copied()
+            .unwrap_or(REACTION_CYCLE[0]);
+        self.threads[ti].reactions.push(pick.to_string());
+        Some(pick.to_string())
+    }
+
+    /// The context-menu entries for the thread at `ti`, in display order. The
+    /// resolve/reopen and mark-read/unread entries flip based on thread state;
+    /// mark-read only appears when there's something to silence.
+    pub fn thread_menu_items(&self, ti: usize) -> Vec<(String, ThreadMenuAction)> {
+        let Some(d) = self.threads.get(ti) else {
+            return Vec::new();
+        };
+        let mut items: Vec<(String, ThreadMenuAction)> =
+            vec![("reply / edit".into(), ThreadMenuAction::Reply)];
+        if d.resolved {
+            items.push(("reopen".into(), ThreadMenuAction::Reopen));
+        } else {
+            items.push(("resolve (hide)".into(), ThreadMenuAction::Resolve));
+        }
+        if needs_attention(d) {
+            items.push(("mark read".into(), ThreadMenuAction::MarkRead));
+        } else if d.acknowledged_at.is_some() {
+            items.push(("mark unread".into(), ThreadMenuAction::MarkUnread));
+        }
+        items.push(("react".into(), ThreadMenuAction::React));
+        items.push(("delete".into(), ThreadMenuAction::Delete));
+        items
     }
 }
 

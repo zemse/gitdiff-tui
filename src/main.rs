@@ -8,7 +8,7 @@ mod syntax;
 mod ui;
 
 use anyhow::Result;
-use app::{AppState, ComposerTarget, FlatKind, FuzzyPicker, Mode};
+use app::{AppState, ComposerTarget, FlatKind, FuzzyPicker, Mode, ThreadMenu, ThreadMenuAction};
 use crossterm::event::{
     self, DisableMouseCapture, EnableMouseCapture, Event, KeyCode, KeyEventKind, KeyModifiers,
     MouseButton, MouseEvent, MouseEventKind,
@@ -19,8 +19,9 @@ use crossterm::terminal::{
 };
 use ratatui::Terminal;
 use ratatui::backend::CrosstermBackend;
+use std::hash::{Hash, Hasher};
 use std::io;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 use tui_textarea::{CursorMove, TextArea};
 
 fn main() -> Result<()> {
@@ -69,6 +70,9 @@ fn main() -> Result<()> {
     }
     let mut state = AppState::new(source.clone(), source_label, files, threads, viewed);
     state.opts = opts;
+    // Prime the diff fingerprint so the idle-tick watcher detects the very
+    // first edit/commit to the reviewed code, with no startup-window race.
+    state.last_diff_fingerprint = Some(diff_fingerprint(&raw));
     state.mark_outdated_threads();
     prefetch_file_blobs(&mut state, &root);
 
@@ -126,6 +130,10 @@ fn run_loop<B: ratatui::backend::Backend>(
     head_sha: Option<&str>,
 ) -> Result<()> {
     let mut composer: Option<TextArea<'static>> = None;
+    // Throttle the (subprocess-spawning) `git diff` watcher so it runs at most
+    // ~once a second instead of on every 250ms idle tick.
+    let diff_poll_interval = Duration::from_millis(750);
+    let mut last_diff_poll = Instant::now();
 
     loop {
         terminal.draw(|f| {
@@ -136,8 +144,13 @@ fn run_loop<B: ratatui::backend::Backend>(
             // Idle tick: pick up CLI writes to the JSON thread store (e.g. an
             // agent ran `gitdiff reply` in another shell). Self-writes are
             // skipped via the cached mtime stamped by `stamp_threads_mtime`.
-            if poll_threads_file(state, root) {
-                // The next iteration renders the freshly merged threads.
+            poll_threads_file(state, root);
+            // ...and re-render the diff if the reviewed code changed on disk.
+            // Skipped while composing so an in-flight comment's anchor doesn't
+            // shift out from under the user mid-keystroke.
+            if state.mode == Mode::Normal && last_diff_poll.elapsed() >= diff_poll_interval {
+                last_diff_poll = Instant::now();
+                poll_diff_changes(state, root);
             }
             continue;
         }
@@ -180,6 +193,13 @@ fn run_loop<B: ratatui::backend::Backend>(
                 }
             }
             Mode::Picker => handle_picker(state, &ev),
+            Mode::ThreadMenu => {
+                if let Event::Mouse(m) = ev {
+                    handle_thread_menu_mouse(state, m, &mut composer);
+                } else {
+                    handle_thread_menu_key(state, &ev, &mut composer);
+                }
+            }
         }
         if state.should_quit {
             return Ok(());
@@ -189,10 +209,46 @@ fn run_loop<B: ratatui::backend::Backend>(
 
 fn reload_diff(state: &mut AppState, root: &std::path::Path) -> Result<()> {
     let raw = git::get_diff(root, &state.source, state.opts)?;
+    state.last_diff_fingerprint = Some(diff_fingerprint(&raw));
     let files = diff::parse(&raw)?;
     state.replace_files(files);
     prefetch_file_blobs(state, root);
     Ok(())
+}
+
+/// Stable hash of the raw diff text — the change signal for the live watcher.
+fn diff_fingerprint(raw: &str) -> u64 {
+    let mut hasher = std::collections::hash_map::DefaultHasher::new();
+    raw.hash(&mut hasher);
+    hasher.finish()
+}
+
+/// Re-render the diff when the reviewed code changes on disk (a new commit, or
+/// staged/unstaged/untracked edits to the working tree). Mirrors `poll_threads_file`:
+/// cheap to call on the idle tick, a no-op when the diff is byte-identical to
+/// what's already shown. `replace_files` anchors scroll/cursor to the same
+/// code, so the view doesn't jump. The diff source is fixed for the session —
+/// we re-render whatever range/working-tree the TUI launched against rather
+/// than re-detecting it (which would swap the thread store mid-review).
+fn poll_diff_changes(state: &mut AppState, root: &std::path::Path) -> bool {
+    let raw = match git::get_diff(root, &state.source, state.opts) {
+        Ok(r) => r,
+        Err(_) => return false,
+    };
+    let fp = diff_fingerprint(&raw);
+    if state.last_diff_fingerprint == Some(fp) {
+        return false;
+    }
+    state.last_diff_fingerprint = Some(fp);
+    let files = match diff::parse(&raw) {
+        Ok(f) => f,
+        Err(_) => return false,
+    };
+    state.replace_files(files);
+    prefetch_file_blobs(state, root);
+    state.mark_outdated_threads();
+    state.status = Some("reloaded — code changed".into());
+    true
 }
 
 fn prefetch_file_blobs(state: &mut AppState, root: &std::path::Path) {
@@ -493,8 +549,8 @@ fn poll_threads_file(state: &mut AppState, root: &std::path::Path) -> bool {
     if prev.is_none() {
         return false;
     }
-    let before: usize = state.threads.iter().map(|t| t.replies.len()).sum::<usize>()
-        + state.threads.len();
+    let before: usize =
+        state.threads.iter().map(|t| t.replies.len()).sum::<usize>() + state.threads.len();
     if review::save_threads_merging(
         root,
         &state.source,
@@ -509,8 +565,8 @@ fn poll_threads_file(state: &mut AppState, root: &std::path::Path) -> bool {
     // Our own re-save bumped the mtime; refresh the cache so the next tick
     // doesn't see it as a foreign write.
     stamp_threads_mtime(state, root);
-    let after: usize = state.threads.iter().map(|t| t.replies.len()).sum::<usize>()
-        + state.threads.len();
+    let after: usize =
+        state.threads.iter().map(|t| t.replies.len()).sum::<usize>() + state.threads.len();
     if after != before {
         state.rebuild_flat();
         state.status = Some("merged updates from CLI".into());
@@ -717,7 +773,11 @@ fn handle_mouse(
                     state.cursor = idx;
                     state.clear_selection();
                     if let Some(ti) = fl.thread_idx {
-                        edit_thread(state, ti, composer);
+                        // Clicking a thread no longer jumps straight into the
+                        // composer — it opens a context menu (reply / resolve /
+                        // mark read / react / delete). "reply / edit" is one of
+                        // the entries.
+                        open_thread_menu(state, ti, idx);
                     }
                 }
                 FlatKind::ExpandBtnAbove | FlatKind::ExpandBtnBelow => {
@@ -923,6 +983,148 @@ fn edit_thread(
     true
 }
 
+/// Open the floating thread context menu over the clicked thread row.
+fn open_thread_menu(state: &mut AppState, thread_idx: usize, anchor_flat_idx: usize) {
+    if state.thread_menu_items(thread_idx).is_empty() {
+        return;
+    }
+    state.thread_menu = Some(ThreadMenu {
+        thread_idx,
+        anchor_flat_idx,
+        cursor: 0,
+    });
+    state.mode = Mode::ThreadMenu;
+}
+
+fn close_thread_menu(state: &mut AppState) {
+    state.thread_menu = None;
+    state.thread_menu_rect = None;
+    state.mode = Mode::Normal;
+}
+
+/// Apply a context-menu action to the menu's thread, then close the menu.
+/// `Reply` re-enters the composer; everything else mutates in memory (persisted
+/// on quit / `S`, same as the equivalent normal-mode keys) and re-flattens.
+fn activate_thread_menu(
+    state: &mut AppState,
+    action: ThreadMenuAction,
+    composer: &mut Option<TextArea<'static>>,
+) {
+    let Some(menu) = state.thread_menu.clone() else {
+        return;
+    };
+    let ti = menu.thread_idx;
+    close_thread_menu(state);
+    if action == ThreadMenuAction::Reply {
+        edit_thread(state, ti, composer);
+        return;
+    }
+    match action {
+        ThreadMenuAction::Resolve => {
+            state.set_resolved(ti, true);
+            state.status = Some("thread resolved (hidden)".into());
+        }
+        ThreadMenuAction::Reopen => {
+            state.set_resolved(ti, false);
+            state.status = Some("thread re-opened".into());
+        }
+        ThreadMenuAction::MarkRead | ThreadMenuAction::MarkUnread => {
+            match state.toggle_acknowledged(ti) {
+                Some(true) => state.status = Some("marked read (silenced)".into()),
+                Some(false) => state.status = Some("marked unread".into()),
+                None => state.status = Some("nothing to mark — last reply is yours".into()),
+            }
+        }
+        ThreadMenuAction::React => {
+            if let Some(r) = state.add_reaction(ti) {
+                state.status = Some(format!("reacted: {r}"));
+            }
+        }
+        ThreadMenuAction::Delete => {
+            state.delete_thread(ti);
+            state.status = Some("thread deleted".into());
+        }
+        ThreadMenuAction::Reply => unreachable!("handled above"),
+    }
+    state.rebuild_flat();
+    state.cursor = state.cursor.min(state.flat.len().saturating_sub(1));
+}
+
+fn handle_thread_menu_key(
+    state: &mut AppState,
+    ev: &Event,
+    composer: &mut Option<TextArea<'static>>,
+) {
+    let Event::Key(key) = ev else { return };
+    if key.kind != KeyEventKind::Press {
+        return;
+    }
+    let Some(ti) = state.thread_menu.as_ref().map(|m| m.thread_idx) else {
+        close_thread_menu(state);
+        return;
+    };
+    let items = state.thread_menu_items(ti);
+    if items.is_empty() {
+        close_thread_menu(state);
+        return;
+    }
+    match key.code {
+        KeyCode::Esc | KeyCode::Char('q') => close_thread_menu(state),
+        KeyCode::Up | KeyCode::Char('k') => {
+            if let Some(m) = state.thread_menu.as_mut() {
+                m.cursor = m.cursor.saturating_sub(1);
+            }
+        }
+        KeyCode::Down | KeyCode::Char('j') => {
+            if let Some(m) = state.thread_menu.as_mut() {
+                m.cursor = (m.cursor + 1).min(items.len() - 1);
+            }
+        }
+        KeyCode::Enter => {
+            let cursor = state.thread_menu.as_ref().map(|m| m.cursor).unwrap_or(0);
+            if let Some((_, action)) = items.get(cursor) {
+                let action = *action;
+                activate_thread_menu(state, action, composer);
+            }
+        }
+        _ => {}
+    }
+}
+
+fn handle_thread_menu_mouse(
+    state: &mut AppState,
+    m: MouseEvent,
+    composer: &mut Option<TextArea<'static>>,
+) {
+    let Some(ti) = state.thread_menu.as_ref().map(|m| m.thread_idx) else {
+        close_thread_menu(state);
+        return;
+    };
+    match m.kind {
+        MouseEventKind::Down(MouseButton::Left) => {
+            match ui::thread_menu_item_at(state, m.column, m.row) {
+                Some(i) => {
+                    let items = state.thread_menu_items(ti);
+                    if let Some((_, action)) = items.get(i) {
+                        let action = *action;
+                        activate_thread_menu(state, action, composer);
+                    }
+                }
+                // Click outside the menu dismisses it.
+                None => close_thread_menu(state),
+            }
+        }
+        MouseEventKind::Moved | MouseEventKind::Drag(MouseButton::Left) => {
+            if let Some(i) = ui::thread_menu_item_at(state, m.column, m.row) {
+                if let Some(menu) = state.thread_menu.as_mut() {
+                    menu.cursor = i;
+                }
+            }
+        }
+        _ => {}
+    }
+}
+
 fn open_composer(state: &mut AppState, composer: &mut Option<TextArea<'static>>) {
     let target = state.decide_composer_target();
     let body = state.initial_composer_body(target);
@@ -1062,6 +1264,30 @@ fn handle_composing(
                 state.status = Some(format!("{msg} (press S to render REVIEW.md)"));
             }
             close_composer(state, composer);
+        }
+        KeyCode::Char('r') if ctrl => {
+            // Hide the comment from the inline diff without deleting it — same
+            // as the normal-mode `r` resolve, reachable while editing/replying.
+            // Resolved threads vanish from the inline view but stay in the JSON
+            // store and REVIEW.md's "Resolved" section; `r` re-opens them.
+            match state.composer_target.and_then(|t| t.thread_idx()) {
+                Some(idx) => {
+                    state.threads[idx].resolved = true;
+                    let _ = review::save_threads_merging(
+                        root,
+                        &state.source,
+                        &mut state.threads,
+                        &mut state.suppressed_disk_replies,
+                        &mut state.suppressed_thread_ids,
+                    );
+                    stamp_threads_mtime(state, root);
+                    close_composer(state, composer);
+                    state.status = Some("comment hidden (resolved) — r to reopen".into());
+                }
+                None => {
+                    state.status = Some("nothing to hide (new comment)".into());
+                }
+            }
         }
         KeyCode::Char('d') if ctrl => {
             // ctrl-d only deletes when editing the original thread. Reply
