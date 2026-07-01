@@ -622,12 +622,42 @@ fn draw_body(f: &mut Frame, area: Rect, state: &AppState) {
     }
     let p = Paragraph::new(lines).wrap(Wrap { trim: false });
     f.render_widget(p, content_area);
+
+    // Thread markers for the scrollbar: one entry per visible (non-resolved,
+    // non-collapsed) thread, positioned by its first ThreadRow in the extended
+    // canvas. `true` = the thread needs your attention (purple), `false` = an
+    // open thread you've already handled (yellow).
+    let mut markers: Vec<(usize, bool)> = Vec::new();
+    let mut seen = std::collections::HashSet::new();
+    for (f_idx, fl) in state.flat.iter().enumerate() {
+        if fl.kind != FlatKind::ThreadRow {
+            continue;
+        }
+        let Some(ti) = fl.thread_idx else { continue };
+        if !seen.insert(ti) {
+            continue;
+        }
+        // flat index -> extended-canvas index (mirror of the mapping above).
+        let ext = if gap_size > 0 && f_idx >= gap_pos {
+            f_idx + gap_size
+        } else {
+            f_idx
+        };
+        let attn = state
+            .threads
+            .get(ti)
+            .map(app::needs_attention)
+            .unwrap_or(false);
+        markers.push((ext, attn));
+    }
+
     draw_scrollbar(
         f,
         sb_area,
         state.scroll,
         total_rows,
         content_area.height as usize,
+        &markers,
     );
 }
 
@@ -852,7 +882,14 @@ fn composer_gap(state: &AppState) -> (usize, usize) {
     (anchor + 1, h)
 }
 
-fn draw_scrollbar(f: &mut Frame, area: Rect, scroll: usize, total: usize, visible_h: usize) {
+fn draw_scrollbar(
+    f: &mut Frame,
+    area: Rect,
+    scroll: usize,
+    total: usize,
+    visible_h: usize,
+    markers: &[(usize, bool)],
+) {
     let track_h = area.height as usize;
     if track_h == 0 || area.width == 0 {
         return;
@@ -863,6 +900,10 @@ fn draw_scrollbar(f: &mut Frame, area: Rect, scroll: usize, total: usize, visibl
     // We render a literal space so there's no font glyph involved at all.
     let track_style = Style::default().bg(Color::Rgb(38, 44, 58));
     let thumb_style = Style::default().bg(Color::Rgb(150, 170, 210));
+    // Thread markers, matching the inline thread frame colours: purple = needs
+    // your attention, yellow = an open thread you've already handled.
+    let attn_color = Color::Rgb(200, 130, 230);
+    let open_color = Color::Rgb(210, 180, 70);
 
     let (thumb_top, thumb_h) = if total <= visible_h || total == 0 {
         (0, track_h)
@@ -878,10 +919,29 @@ fn draw_scrollbar(f: &mut Frame, area: Rect, scroll: usize, total: usize, visibl
         (top.min(span), h)
     };
 
+    // Project each thread's canvas position onto a track row. A row wins the
+    // purple marker if any thread mapped there needs attention.
+    let mut marker_rows: Vec<Option<bool>> = vec![None; track_h];
+    if total > 0 {
+        for &(pos, attn) in markers {
+            let row = (pos * track_h / total).min(track_h - 1);
+            marker_rows[row] = Some(match marker_rows[row] {
+                Some(prev) => prev || attn,
+                None => attn,
+            });
+        }
+    }
+
     let lines: Vec<Line<'static>> = (0..track_h)
         .map(|i| {
-            let in_thumb = i >= thumb_top && i < thumb_top + thumb_h;
-            let style = if in_thumb { thumb_style } else { track_style };
+            let style = match marker_rows[i] {
+                Some(true) => Style::default().bg(attn_color),
+                Some(false) => Style::default().bg(open_color),
+                None => {
+                    let in_thumb = i >= thumb_top && i < thumb_top + thumb_h;
+                    if in_thumb { thumb_style } else { track_style }
+                }
+            };
             Line::from(Span::styled(" ", style))
         })
         .collect();
