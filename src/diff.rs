@@ -215,7 +215,30 @@ pub fn parse(input: &str) -> Result<Vec<FileDiff>> {
         });
     }
 
+    sort_files_github_order(&mut files);
     Ok(files)
+}
+
+/// Reorder files to match GitHub's "Files changed" / changes view.
+///
+/// `git diff` emits paths in a flat byte-wise (`strcmp`) order, where the path
+/// separator `/` (0x2F) sorts *after* characters like `.` (0x2E). GitHub instead
+/// lays files out as a directory tree and walks it depth-first, comparing paths
+/// one path-segment at a time. The two differ whenever a file and a directory
+/// share a prefix: git orders `foo.rs` before `foo/bar.rs` (because `.` < `/`),
+/// while GitHub descends the `foo/` directory grouped by its segment name `foo`,
+/// putting `foo/bar.rs` first. Entries are intermixed alphabetically at each
+/// level (files and directories together, not folders-first).
+///
+/// Comparing the `/`-split segment lists lexicographically is exactly a
+/// depth-first walk of the alphabetically-sorted tree, so it reproduces
+/// GitHub's order without materializing the tree.
+fn sort_files_github_order(files: &mut [FileDiff]) {
+    files.sort_by(|a, b| {
+        let a_segs = a.path.split('/');
+        let b_segs = b.path.split('/');
+        a_segs.cmp(b_segs)
+    });
 }
 
 fn strip_ab_prefix(p: &str) -> &str {
@@ -348,5 +371,49 @@ index 1111111..2222222 100644
         assert_eq!(files[0].status, FileStatus::Renamed);
         assert_eq!(files[0].path, "new.txt");
         assert_eq!(files[0].old_path.as_deref(), Some("old.txt"));
+    }
+
+    #[test]
+    fn orders_files_like_github_tree() {
+        // git's flat byte order would put `foo.rs` before `foo/bar.rs` (`.` < `/`)
+        // and `src-utils/x.rs` before `src/a.rs` (`-` < `/`). GitHub's tree order
+        // compares segment-by-segment, flipping both. Paths are fed here in git's
+        // order to prove we reorder them.
+        let raw = "\
+diff --git a/foo.rs b/foo.rs
+index 1..2 100644
+--- a/foo.rs
++++ b/foo.rs
+@@ -1 +1 @@
+-a
++b
+diff --git a/foo/bar.rs b/foo/bar.rs
+index 1..2 100644
+--- a/foo/bar.rs
++++ b/foo/bar.rs
+@@ -1 +1 @@
+-a
++b
+diff --git a/src-utils/x.rs b/src-utils/x.rs
+index 1..2 100644
+--- a/src-utils/x.rs
++++ b/src-utils/x.rs
+@@ -1 +1 @@
+-a
++b
+diff --git a/src/a.rs b/src/a.rs
+index 1..2 100644
+--- a/src/a.rs
++++ b/src/a.rs
+@@ -1 +1 @@
+-a
++b
+";
+        let files = parse(raw).unwrap();
+        let order: Vec<&str> = files.iter().map(|f| f.path.as_str()).collect();
+        assert_eq!(
+            order,
+            vec!["foo/bar.rs", "foo.rs", "src/a.rs", "src-utils/x.rs"]
+        );
     }
 }
