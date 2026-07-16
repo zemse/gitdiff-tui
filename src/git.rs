@@ -224,6 +224,17 @@ fn untracked_diff(root: &Path, opts: DiffOpts) -> Result<String> {
     let ctx = format!("-U{}", opts.context_lines);
     let mut out = String::new();
     for path in list_untracked(root)? {
+        // Skip reading/diffing brand-new files above the size cap. A large
+        // untracked blob (multi-MB JSON dumps, logs, build artifacts) would
+        // otherwise be read into memory, parsed, and syntax-highlighted line
+        // by line at startup — enough to freeze the TUI for minutes. Emit a
+        // stub the parser turns into an `omitted` placeholder instead.
+        if let Ok(meta) = std::fs::metadata(root.join(&path)) {
+            if meta.is_file() && meta.len() > MAX_UNTRACKED_RENDER_BYTES {
+                out.push_str(&omitted_stub(&path, meta.len()));
+                continue;
+            }
+        }
         let mut args: Vec<&str> = vec!["diff", "--no-color", "--no-ext-diff", &ctx, "--no-index"];
         if opts.ignore_whitespace {
             args.push("-w");
@@ -235,6 +246,20 @@ fn untracked_diff(root: &Path, opts: DiffOpts) -> Result<String> {
         }
     }
     Ok(out)
+}
+
+/// Untracked files larger than this are shown as a collapsed "not rendered"
+/// placeholder rather than having their full content ingested and highlighted.
+const MAX_UNTRACKED_RENDER_BYTES: u64 = 256 * 1024;
+
+/// A synthetic "new file" diff carrying no content, plus a `GITDIFF-OMITTED`
+/// marker line the parser reads to flag the file as omitted (size in bytes).
+/// Shaped like git's own new-file header so the diff parser needs no special
+/// casing beyond recognizing the marker.
+fn omitted_stub(path: &str, bytes: u64) -> String {
+    format!(
+        "diff --git a/{path} b/{path}\nnew file mode 100644\n--- /dev/null\n+++ b/{path}\nGITDIFF-OMITTED {bytes}\n"
+    )
 }
 
 /// Read the "new side" content of a file as a Vec of lines. For the working

@@ -92,6 +92,48 @@ fn working_tree_diff_includes_untracked_files() {
 }
 
 #[test]
+fn large_untracked_file_is_omitted_not_ingested() {
+    let tmp = tempdir_in_target("gitdiff_e2e_large_untracked");
+    git(&tmp, &["init", "-q", "-b", "main"]);
+    git(&tmp, &["config", "user.email", "t@t"]);
+    git(&tmp, &["config", "user.name", "t"]);
+
+    fs::write(tmp.join("tracked.rs"), "fn main() {}\n").unwrap();
+    git(&tmp, &["add", "tracked.rs"]);
+    git(&tmp, &["commit", "-q", "-m", "init"]);
+
+    // A small new file (rendered in full) next to a large one (> 256 KiB, so
+    // its content is skipped and it appears only as an omitted placeholder).
+    fs::write(tmp.join("small.rs"), "fn brand_new() {}\n").unwrap();
+    let big = "MARKER_LINE_THAT_MUST_NOT_APPEAR\n".repeat(20_000); // ~660 KiB
+    fs::write(tmp.join("big.json"), &big).unwrap();
+
+    let out = Command::new(env!("CARGO_BIN_EXE_gitdiff"))
+        .arg("diff")
+        .current_dir(&tmp)
+        .output()
+        .expect("run gitdiff diff");
+    assert!(out.status.success());
+    let raw = String::from_utf8(out.stdout).unwrap();
+
+    // small file rendered normally
+    assert!(
+        raw.contains("+fn brand_new() {}"),
+        "small untracked file should be rendered in full:\n{raw}"
+    );
+    // large file present as an omitted stub, content NOT ingested
+    assert!(
+        raw.contains("diff --git a/big.json b/big.json") && raw.contains("GITDIFF-OMITTED "),
+        "large untracked file should appear as an omitted stub:\n{raw}"
+    );
+    assert!(
+        !raw.contains("MARKER_LINE_THAT_MUST_NOT_APPEAR"),
+        "large untracked file content must not be read into the diff:\n{}",
+        &raw[..raw.len().min(2000)]
+    );
+}
+
+#[test]
 fn branch_diff_against_upstream() {
     let tmp = tempdir_in_target("gitdiff_e2e_br");
     git(&tmp, &["init", "-q", "-b", "main"]);

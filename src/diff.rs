@@ -57,6 +57,12 @@ pub struct FileDiff {
     pub additions: usize,
     pub deletions: usize,
     pub binary: bool,
+    /// `Some(size_in_bytes)` when the file's content was deliberately not
+    /// ingested (a large brand-new/untracked file). The diff carries no hunks;
+    /// the UI shows a one-line "not rendered" placeholder instead. Keeps a
+    /// giant untracked blob (e.g. a multi-MB JSON dump) from being read and
+    /// syntax-highlighted at startup, which would otherwise hang the TUI.
+    pub omitted: Option<u64>,
 }
 
 pub fn parse(input: &str) -> Result<Vec<FileDiff>> {
@@ -75,6 +81,7 @@ pub fn parse(input: &str) -> Result<Vec<FileDiff>> {
         let mut new_path = b;
         let mut status = FileStatus::Modified;
         let mut binary = false;
+        let mut omitted: Option<u64> = None;
         let mut hunks: Vec<Hunk> = Vec::new();
         let mut additions = 0usize;
         let mut deletions = 0usize;
@@ -119,6 +126,12 @@ pub fn parse(input: &str) -> Result<Vec<FileDiff>> {
                 || l.contains(" differ") && l.contains("Binary")
             {
                 binary = true;
+            } else if let Some(rest) = l.strip_prefix("GITDIFF-OMITTED ") {
+                // Synthetic marker emitted by `untracked_diff` for large new
+                // files whose content we intentionally skipped. Not real git
+                // output; see git::untracked_diff.
+                omitted = rest.trim().parse::<u64>().ok();
+                status = FileStatus::Added;
             }
         }
 
@@ -212,6 +225,7 @@ pub fn parse(input: &str) -> Result<Vec<FileDiff>> {
             additions,
             deletions,
             binary,
+            omitted,
         });
     }
 
@@ -349,6 +363,25 @@ index 0000000..1111111
         // addition "println!(\"new\");": no old, new 2
         assert_eq!(h.lines[2].kind, LineKind::Added);
         assert_eq!(h.lines[2].new_lineno, Some(2));
+    }
+
+    #[test]
+    fn parses_omitted_marker() {
+        // The synthetic stub git::untracked_diff emits for oversized new files.
+        let raw = "\
+diff --git a/perf/runs/big.json b/perf/runs/big.json
+new file mode 100644
+--- /dev/null
++++ b/perf/runs/big.json
+GITDIFF-OMITTED 1551693
+";
+        let files = parse(raw).unwrap();
+        assert_eq!(files.len(), 1);
+        assert_eq!(files[0].path, "perf/runs/big.json");
+        assert_eq!(files[0].status, FileStatus::Added);
+        assert_eq!(files[0].omitted, Some(1551693));
+        assert!(files[0].hunks.is_empty());
+        assert_eq!(files[0].additions, 0);
     }
 
     #[test]

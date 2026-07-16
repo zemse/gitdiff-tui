@@ -1833,12 +1833,24 @@ fn common_affixes(a: &str, b: &str) -> (usize, usize) {
     (prefix, suffix)
 }
 
+/// Upper bound on lines syntax-highlighted at startup. Highlighting is the
+/// dominant cost of loading a diff; capping it keeps startup well under a
+/// second even for pathologically large diffs. Lines past the budget render
+/// as plain (un-highlighted) text — the renderer already falls back gracefully
+/// when a line has no precomputed spans.
+const MAX_HIGHLIGHT_LINES: usize = 50_000;
+
 fn precompute_highlights(files: &[FileDiff]) -> HashMap<LineKey, Vec<HSpan>> {
     let hl = Highlighter::global();
     let mut out = HashMap::new();
+    let mut budget = MAX_HIGHLIGHT_LINES;
     for (fi, f) in files.iter().enumerate() {
         for (hi, h) in f.hunks.iter().enumerate() {
             for (li, l) in h.lines.iter().enumerate() {
+                if budget == 0 {
+                    return out;
+                }
+                budget -= 1;
                 let spans = hl.highlight(&f.path, &l.content);
                 out.insert((fi, hi, li), spans);
             }

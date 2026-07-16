@@ -1004,6 +1004,12 @@ fn render_file_header(state: &AppState, fi: usize, width: usize) -> Line<'static
     if f.binary {
         spans.push(Span::styled(" [binary]", bg.fg(Color::DarkGray)));
     }
+    if let Some(bytes) = f.omitted {
+        spans.push(Span::styled(
+            format!(" [{}, not rendered]", human_size(bytes)),
+            bg.fg(Color::DarkGray),
+        ));
+    }
 
     // right-aligned "viewed" indicator: pad first, then the badge
     let viewed_badge = if viewed {
@@ -1493,6 +1499,19 @@ fn apply_intraline(
         col = span_end;
     }
     out
+}
+
+/// Compact human-readable byte size for file-header badges (e.g. "1.5 MB").
+fn human_size(bytes: u64) -> String {
+    const KB: u64 = 1024;
+    const MB: u64 = 1024 * 1024;
+    const GB: u64 = 1024 * 1024 * 1024;
+    match bytes {
+        b if b >= GB => format!("{:.1} GB", b as f64 / GB as f64),
+        b if b >= MB => format!("{:.1} MB", b as f64 / MB as f64),
+        b if b >= KB => format!("{:.1} KB", b as f64 / KB as f64),
+        b => format!("{b} B"),
+    }
 }
 
 fn hspan_to_ratatui(hs: &HSpan, bg: Color) -> Span<'static> {
