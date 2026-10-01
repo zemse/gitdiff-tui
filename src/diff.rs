@@ -63,6 +63,8 @@ pub struct FileDiff {
     /// giant untracked blob (e.g. a multi-MB JSON dump) from being read and
     /// syntax-highlighted at startup, which would otherwise hang the TUI.
     pub omitted: Option<u64>,
+    /// git's `similarity index` for a rename or copy, in percent.
+    pub similarity: Option<u8>,
 }
 
 pub fn parse(input: &str) -> Result<Vec<FileDiff>> {
@@ -82,6 +84,7 @@ pub fn parse(input: &str) -> Result<Vec<FileDiff>> {
         let mut status = FileStatus::Modified;
         let mut binary = false;
         let mut omitted: Option<u64> = None;
+        let mut similarity: Option<u8> = None;
         let mut hunks: Vec<Hunk> = Vec::new();
         let mut additions = 0usize;
         let mut deletions = 0usize;
@@ -100,6 +103,8 @@ pub fn parse(input: &str) -> Result<Vec<FileDiff>> {
                 old_path = None;
             } else if l.starts_with("deleted file mode") {
                 status = FileStatus::Deleted;
+            } else if let Some(rest) = l.strip_prefix("similarity index ") {
+                similarity = rest.trim_end_matches('%').parse().ok();
             } else if l.starts_with("rename from ") {
                 status = FileStatus::Renamed;
                 old_path = Some(l.trim_start_matches("rename from ").to_string());
@@ -226,6 +231,7 @@ pub fn parse(input: &str) -> Result<Vec<FileDiff>> {
             deletions,
             binary,
             omitted,
+            similarity,
         });
     }
 
@@ -404,6 +410,34 @@ index 1111111..2222222 100644
         assert_eq!(files[0].status, FileStatus::Renamed);
         assert_eq!(files[0].path, "new.txt");
         assert_eq!(files[0].old_path.as_deref(), Some("old.txt"));
+        assert_eq!(files[0].similarity, Some(90));
+    }
+
+    #[test]
+    fn parses_copy() {
+        let raw = "\
+diff --git a/circuits/transfer/core.circom b/circuits/experiment/transfer/core.circom
+similarity index 96%
+copy from circuits/transfer/core.circom
+copy to circuits/experiment/transfer/core.circom
+index 1111111..2222222 100644
+--- a/circuits/transfer/core.circom
++++ b/circuits/experiment/transfer/core.circom
+@@ -1,2 +1,2 @@
+-include \"poseidon.circom\";
++include \"poseidon2.circom\";
+ template Core() {}
+";
+        let files = parse(raw).unwrap();
+        assert_eq!(files.len(), 1);
+        assert_eq!(files[0].status, FileStatus::Copied);
+        assert_eq!(files[0].path, "circuits/experiment/transfer/core.circom");
+        assert_eq!(
+            files[0].old_path.as_deref(),
+            Some("circuits/transfer/core.circom")
+        );
+        assert_eq!(files[0].similarity, Some(96));
+        assert_eq!((files[0].additions, files[0].deletions), (1, 1));
     }
 
     #[test]

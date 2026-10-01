@@ -60,6 +60,22 @@ gitdiff                  # auto-detects: working changes, else branch vs upstrea
 gitdiff base..head       # explicit range
 ```
 
+### Reviewing copied files
+
+A new file adapted from an existing one normally shows as 100% added. Copy
+detection diffs it against its source instead, shown as `C 96% src → dst`.
+Off by default; the flags work on the TUI, `diff`, and `comment`.
+
+```sh
+gitdiff base..head --find-copies-harder        # unchanged files can be sources too
+gitdiff base..head --find-copies=20            # copies only, custom threshold (default 50%)
+gitdiff base..head --copy-source dst=src       # pin the source when detection misses (repeatable)
+```
+
+Comments stay anchored to the destination file. For the working tree,
+untracked files are not copy candidates; `git add -N` them first, or use
+`--copy-source`.
+
 ## CLI subcommands (for agents and scripting)
 
 The same comment store the TUI uses is exposed as non-interactive subcommands

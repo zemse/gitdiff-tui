@@ -166,10 +166,17 @@ fn resolve_base(root: &Path) -> Result<String> {
     }
 }
 
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone)]
 pub struct DiffOpts {
     pub ignore_whitespace: bool,
     pub context_lines: usize,
+    /// `Some(threshold%)` enables git copy detection (`-C<n>%`).
+    pub find_copies: Option<u8>,
+    /// Let unchanged files be copy sources (`--find-copies-harder`).
+    pub find_copies_harder: bool,
+    /// Explicit `(dst, src)` pairs: diff `dst` against `src` as a copy,
+    /// replacing whatever git produced for `dst`.
+    pub copy_sources: Vec<(String, String)>,
 }
 
 impl Default for DiffOpts {
@@ -177,12 +184,20 @@ impl Default for DiffOpts {
         Self {
             ignore_whitespace: false,
             context_lines: 3,
+            find_copies: None,
+            find_copies_harder: false,
+            copy_sources: Vec::new(),
         }
     }
 }
 
-pub fn get_diff(root: &Path, source: &DiffSource, opts: DiffOpts) -> Result<String> {
+/// Default similarity threshold for `--find-copies` / `--find-copies-harder`
+/// without an explicit value, matching git's own `-C` default.
+pub const DEFAULT_COPY_THRESHOLD: u8 = 50;
+
+pub fn get_diff(root: &Path, source: &DiffSource, opts: &DiffOpts) -> Result<String> {
     let ctx = format!("-U{}", opts.context_lines);
+    let copies = opts.find_copies.map(|t| format!("-C{t}%"));
     let mut base_args: Vec<&str> = vec![
         "diff",
         "--no-color",
@@ -193,7 +208,13 @@ pub fn get_diff(root: &Path, source: &DiffSource, opts: DiffOpts) -> Result<Stri
     if opts.ignore_whitespace {
         base_args.push("-w");
     }
-    match source {
+    if let Some(c) = &copies {
+        base_args.push(c);
+        if opts.find_copies_harder {
+            base_args.push("--find-copies-harder");
+        }
+    }
+    let out = match source {
         DiffSource::WorkingTree => {
             let mut args = base_args;
             args.push("HEAD");
@@ -202,25 +223,117 @@ pub fn get_diff(root: &Path, source: &DiffSource, opts: DiffOpts) -> Result<Stri
             // file as a synthetic new-file diff so they show up alongside the
             // staged/unstaged changes.
             out.push_str(&untracked_diff(root, opts)?);
-            Ok(out)
+            out
         }
         DiffSource::Branch { base, head } => {
-            let merge_base = run(&["merge-base", base, head], Some(root))
-                .map(|s| s.trim().to_string())
-                .unwrap_or_else(|_| base.clone());
-            let range = format!("{merge_base}..{head}");
+            let range = format!("{}..{head}", merge_base(root, base, head));
             let mut args = base_args;
             args.push(&range);
-            run(&args, Some(root))
+            run(&args, Some(root))?
+        }
+    };
+    apply_copy_sources(root, source, opts, out)
+}
+
+fn merge_base(root: &Path, base: &str, head: &str) -> String {
+    run(&["merge-base", base, head], Some(root))
+        .map(|s| s.trim().to_string())
+        .unwrap_or_else(|_| base.to_string())
+}
+
+/// Swap the diff for each `--copy-source` destination with a diff against its
+/// named source, marked up as a git copy so the parser shows `C src → dst`.
+/// The source is read from the preimage (merge-base for a range, disk for the
+/// working tree); the destination from the reviewed side.
+fn apply_copy_sources(
+    root: &Path,
+    source: &DiffSource,
+    opts: &DiffOpts,
+    raw: String,
+) -> Result<String> {
+    if opts.copy_sources.is_empty() {
+        return Ok(raw);
+    }
+    let ctx = format!("-U{}", opts.context_lines);
+    let mut args: Vec<String> = vec![
+        "diff".into(),
+        "--no-color".into(),
+        "--no-ext-diff".into(),
+        ctx,
+    ];
+    if opts.ignore_whitespace {
+        args.push("-w".into());
+    }
+    let mut out = String::new();
+    let mut replaced: Vec<&str> = Vec::new();
+    for (dst, src) in &opts.copy_sources {
+        let mut a = args.clone();
+        let patch = match source {
+            DiffSource::WorkingTree => {
+                a.extend(["--no-index".into(), "--".into(), src.clone(), dst.clone()]);
+                let a: Vec<&str> = a.iter().map(String::as_str).collect();
+                run_no_index(&a, root)?.unwrap_or_default()
+            }
+            DiffSource::Branch { base, head } => {
+                let mb = merge_base(root, base, head);
+                a.extend([format!("{mb}:{src}"), format!("{head}:{dst}")]);
+                let a: Vec<&str> = a.iter().map(String::as_str).collect();
+                run(&a, Some(root))?
+            }
+        };
+        out.push_str(&mark_as_copy(&patch, src, dst));
+        replaced.push(dst);
+    }
+    let mut kept = String::new();
+    for block in split_file_blocks(&raw) {
+        let dst = crate::diff::parse(block)
+            .ok()
+            .and_then(|f| f.into_iter().next())
+            .map(|f| f.path);
+        if !dst.is_some_and(|d| replaced.contains(&d.as_str())) {
+            kept.push_str(block);
         }
     }
+    kept.push_str(&out);
+    Ok(kept)
+}
+
+/// Rewrite a two-path patch's header into git's copy form. An identical pair
+/// yields no patch from git, so emit a bare 100% copy header instead.
+fn mark_as_copy(patch: &str, src: &str, dst: &str) -> String {
+    let header = format!("diff --git a/{src} b/{dst}\n");
+    let body = patch.split_once('\n').map(|(_, rest)| rest);
+    match body {
+        Some(rest) if patch.starts_with("diff --git ") => {
+            format!("{header}copy from {src}\ncopy to {dst}\n{rest}")
+        }
+        _ => format!("{header}similarity index 100%\ncopy from {src}\ncopy to {dst}\n"),
+    }
+}
+
+/// Split a multi-file patch into per-file chunks, each starting at its
+/// `diff --git` line. Anything before the first header is dropped.
+fn split_file_blocks(raw: &str) -> Vec<&str> {
+    let mut starts: Vec<usize> = Vec::new();
+    let mut pos = 0;
+    for line in raw.split_inclusive('\n') {
+        if line.starts_with("diff --git ") {
+            starts.push(pos);
+        }
+        pos += line.len();
+    }
+    starts
+        .iter()
+        .enumerate()
+        .map(|(i, &s)| &raw[s..starts.get(i + 1).copied().unwrap_or(raw.len())])
+        .collect()
 }
 
 /// Produce concatenated "new file" diffs for every untracked file, using
 /// `git diff --no-index /dev/null <path>`. The output is the same format git
 /// emits for a newly added tracked file, so the diff parser treats each as an
 /// `Added` file without any special-casing.
-fn untracked_diff(root: &Path, opts: DiffOpts) -> Result<String> {
+fn untracked_diff(root: &Path, opts: &DiffOpts) -> Result<String> {
     let ctx = format!("-U{}", opts.context_lines);
     let mut out = String::new();
     for path in list_untracked(root)? {

@@ -979,7 +979,10 @@ fn render_file_header(state: &AppState, fi: usize, width: usize) -> Line<'static
         Span::styled("╭".to_string(), border),
         Span::styled(format!(" {chevron} "), bg.fg(Color::White)),
         Span::styled(
-            format!(" {badge} "),
+            match f.similarity {
+                Some(pct) => format!(" {badge} {pct}% "),
+                None => format!(" {badge} "),
+            },
             badge_style.add_modifier(Modifier::BOLD),
         ),
         Span::styled(

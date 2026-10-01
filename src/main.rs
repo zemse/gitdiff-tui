@@ -38,8 +38,9 @@ fn main() -> Result<()> {
     let root = git::repo_root()?;
     let source = git::detect_source(&root, override_range)?;
     let source_label = source.label();
-    let opts = git::DiffOpts::default();
-    let raw = git::get_diff(&root, &source, opts)?;
+    let mut opts = git::DiffOpts::default();
+    cli.copies.apply(&mut opts);
+    let raw = git::get_diff(&root, &source, &opts)?;
     let files = diff::parse(&raw)?;
 
     let mut threads = review::load_threads(&root, &source)?;
@@ -208,7 +209,7 @@ fn run_loop<B: ratatui::backend::Backend>(
 }
 
 fn reload_diff(state: &mut AppState, root: &std::path::Path) -> Result<()> {
-    let raw = git::get_diff(root, &state.source, state.opts)?;
+    let raw = git::get_diff(root, &state.source, &state.opts)?;
     state.last_diff_fingerprint = Some(diff_fingerprint(&raw));
     let files = diff::parse(&raw)?;
     state.replace_files(files);
@@ -231,7 +232,7 @@ fn diff_fingerprint(raw: &str) -> u64 {
 /// we re-render whatever range/working-tree the TUI launched against rather
 /// than re-detecting it (which would swap the thread store mid-review).
 fn poll_diff_changes(state: &mut AppState, root: &std::path::Path) -> bool {
-    let raw = match git::get_diff(root, &state.source, state.opts) {
+    let raw = match git::get_diff(root, &state.source, &state.opts) {
         Ok(r) => r,
         Err(_) => return false,
     };

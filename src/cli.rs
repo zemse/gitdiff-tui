@@ -34,6 +34,9 @@ pub struct Cli {
     /// Optional `<base>..<head>` range for the TUI. Auto-detected if absent.
     pub range: Option<String>,
 
+    #[command(flatten)]
+    pub copies: CopyArgs,
+
     #[command(subcommand)]
     pub command: Option<Commands>,
 }
@@ -50,6 +53,8 @@ pub enum Commands {
         /// Ignore whitespace differences (passes `-w` to git diff).
         #[arg(long = "ignore-whitespace")]
         ignore_whitespace: bool,
+        #[command(flatten)]
+        copies: CopyArgs,
     },
 
     /// List comment threads (open by default).
@@ -92,6 +97,8 @@ pub enum Commands {
         side: String,
         #[command(flatten)]
         body: BodyInput,
+        #[command(flatten)]
+        copies: CopyArgs,
         /// Author handle (default `agent`). Agents may pass a specific name
         /// like `claude-code`, `codex`, `gemini`; a human driving the CLI
         /// passes `--author you`.
@@ -183,6 +190,50 @@ pub enum Commands {
     },
 }
 
+/// Copy detection, so a new file adapted from an existing one diffs against
+/// its source instead of showing every line as added. Off unless requested.
+#[derive(Args, Debug, Clone, Default)]
+pub struct CopyArgs {
+    /// Detect copies, with an optional similarity threshold in percent
+    /// (default 50). Passes `-C<n>%` to git diff.
+    #[arg(
+        long = "find-copies",
+        value_name = "PERCENT",
+        num_args = 0..=1,
+        require_equals = true,
+        default_missing_value = "50",
+        value_parser = clap::value_parser!(u8).range(0..=100)
+    )]
+    find_copies: Option<u8>,
+    /// Also consider unchanged files as copy sources. Implies
+    /// `--find-copies`. Slower on large repos.
+    #[arg(long = "find-copies-harder")]
+    find_copies_harder: bool,
+    /// Diff `<DST>` against `<SRC>` as a copy, overriding copy detection.
+    /// Repeatable. Comments stay anchored to `<DST>`.
+    #[arg(long = "copy-source", value_name = "DST=SRC", value_parser = parse_copy_source)]
+    copy_source: Vec<(String, String)>,
+}
+
+impl CopyArgs {
+    pub fn apply(&self, opts: &mut DiffOpts) {
+        opts.find_copies = self.find_copies.or(self
+            .find_copies_harder
+            .then_some(git::DEFAULT_COPY_THRESHOLD));
+        opts.find_copies_harder = self.find_copies_harder;
+        opts.copy_sources = self.copy_source.clone();
+    }
+}
+
+fn parse_copy_source(s: &str) -> Result<(String, String), String> {
+    match s.split_once('=') {
+        Some((dst, src)) if !dst.is_empty() && !src.is_empty() => {
+            Ok((dst.to_string(), src.to_string()))
+        }
+        _ => Err(format!("expected DST=SRC, got '{s}'")),
+    }
+}
+
 /// Mutually-exclusive body source. clap enforces "exactly one" at parse time
 /// via the ArgGroup attributes below.
 #[derive(Args, Debug)]
@@ -257,16 +308,22 @@ fn resolve_source(range: Option<String>) -> Result<(PathBuf, DiffSource)> {
 // Subcommand entrypoints
 // ----------------------------------------------------------------------------
 
-fn cmd_diff(range: Option<String>, context: Option<usize>, ignore_ws: bool) -> Result<()> {
+fn cmd_diff(
+    range: Option<String>,
+    context: Option<usize>,
+    ignore_ws: bool,
+    copies: &CopyArgs,
+) -> Result<()> {
     let (root, source) = resolve_source(range)?;
     let mut opts = DiffOpts::default();
+    copies.apply(&mut opts);
     if ignore_ws {
         opts.ignore_whitespace = true;
     }
     if let Some(c) = context {
         opts.context_lines = c;
     }
-    let raw = git::get_diff(&root, &source, opts)?;
+    let raw = git::get_diff(&root, &source, &opts)?;
     print!("{raw}");
     Ok(())
 }
@@ -419,6 +476,7 @@ fn cmd_comment(
     end: Option<usize>,
     side: String,
     body_input: &BodyInput,
+    copies: &CopyArgs,
     author: String,
 ) -> Result<()> {
     let body = body_input.read()?;
@@ -428,7 +486,9 @@ fn cmd_comment(
     // Look up the real diff line so context-line anchors store both
     // (old, new) fields — without this, threads on unchanged lines never
     // re-match in the TUI and get hidden as outdated.
-    let raw_diff = git::get_diff(&root, &source, DiffOpts::default())?;
+    let mut opts = DiffOpts::default();
+    copies.apply(&mut opts);
+    let raw_diff = git::get_diff(&root, &source, &opts)?;
     let files = diff::parse(&raw_diff)?;
     let file_diff = files.iter().find(|f| f.path == file);
 
@@ -885,6 +945,7 @@ pub fn parse_and_dispatch() -> Result<Option<Cli>> {
     let Some(command) = cli.command else {
         return Ok(Some(Cli {
             range: cli.range,
+            copies: cli.copies,
             command: None,
         }));
     };
@@ -894,7 +955,8 @@ pub fn parse_and_dispatch() -> Result<Option<Cli>> {
             range,
             context,
             ignore_whitespace,
-        } => cmd_diff(range, context, ignore_whitespace)?,
+            copies,
+        } => cmd_diff(range, context, ignore_whitespace, &copies)?,
         Commands::List { range, all, json } => cmd_list(range, all, json)?,
         Commands::Show {
             thread_id,
@@ -908,8 +970,9 @@ pub fn parse_and_dispatch() -> Result<Option<Cli>> {
             end,
             side,
             body,
+            copies,
             author,
-        } => cmd_comment(file, line, range, end, side, &body, author)?,
+        } => cmd_comment(file, line, range, end, side, &body, &copies, author)?,
         Commands::Reply {
             thread_id,
             range,
