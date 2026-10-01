@@ -735,21 +735,32 @@ fn handle_mouse(
         MouseEventKind::ScrollDown => state.scroll_by(3),
         MouseEventKind::ScrollUp => state.scroll_by(-3),
         MouseEventKind::Down(MouseButton::Left) => {
-            let Some(idx) = row_to_idx(m.row) else { return };
+            let Some(mut idx) = row_to_idx(m.row) else {
+                return;
+            };
+            // The top row may be the pinned header of the file scrolled into;
+            // a click there acts on that file's real header.
+            if m.row == body_top {
+                if let Some(h) = state.sticky_file.and_then(|fi| {
+                    state
+                        .flat
+                        .iter()
+                        .position(|fl| fl.file_idx == fi && fl.kind == FlatKind::FileHeader)
+                }) {
+                    idx = h;
+                }
+            }
             let fl = state.flat[idx].clone();
             match fl.kind {
-                FlatKind::FileHeader | FlatKind::FileFooter => {
+                FlatKind::FileHeader => {
                     state.cursor = idx;
                     state.clear_selection();
                     // Right-aligned " ✓ viewed " / " ☐ viewed " badge is 10
-                    // chars wide; the closing `╮`/`╯` is the very last column.
-                    // A collapsed file's footer has no badge.
+                    // chars wide; the closing `╮` is the very last column.
                     let rel_col = m.column.saturating_sub(state.body_x);
                     let badge_start = state.body_width.saturating_sub(11);
                     let badge_end = state.body_width.saturating_sub(1);
-                    let has_badge = fl.kind == FlatKind::FileHeader
-                        || state.expanded.get(fl.file_idx).copied().unwrap_or(true);
-                    if has_badge && rel_col >= badge_start && rel_col < badge_end {
+                    if rel_col >= badge_start && rel_col < badge_end {
                         if let Some(now) = state.toggle_viewed(fl.file_idx) {
                             state.status = Some(if now {
                                 "marked viewed (collapsed)".into()
@@ -760,6 +771,11 @@ fn handle_mouse(
                     } else {
                         state.toggle_collapse(fl.file_idx);
                     }
+                }
+                FlatKind::FileFooter => {
+                    state.cursor = idx;
+                    state.clear_selection();
+                    state.toggle_collapse(fl.file_idx);
                 }
                 FlatKind::HunkHeader => {
                     state.cursor = idx;

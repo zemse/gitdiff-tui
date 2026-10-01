@@ -530,7 +530,7 @@ fn draw_footer(f: &mut Frame, area: Rect, state: &AppState) {
     f.render_widget(Paragraph::new(line), area);
 }
 
-fn draw_body(f: &mut Frame, area: Rect, state: &AppState) {
+fn draw_body(f: &mut Frame, area: Rect, state: &mut AppState) {
     // reserve one column on the right for the scrollbar
     let sb_w: u16 = 1;
     let content_area = Rect {
@@ -557,7 +557,26 @@ fn draw_body(f: &mut Frame, area: Rect, state: &AppState) {
     let to = (state.scroll + content_area.height as usize).min(total_rows);
 
     let sel_range = state.selection.map(|s| s.range());
+    // Pin the current file's header over the top row once its real header
+    // has scrolled off, so the name and viewed toggle stay in reach.
+    let top_flat = if gap_size > 0 && from >= gap_pos + gap_size {
+        from - gap_size
+    } else {
+        from
+    };
+    let in_gap = gap_size > 0 && from >= gap_pos && from < gap_pos + gap_size;
+    state.sticky_file = if in_gap {
+        None
+    } else {
+        state.sticky_file_at(top_flat)
+    };
     for ext_i in from..to {
+        if ext_i == from {
+            if let Some(fi) = state.sticky_file {
+                lines.push(render_file_header(state, fi, width));
+                continue;
+            }
+        }
         // map extended-canvas index to flat[] index, accounting for the gap
         if gap_size > 0 && ext_i >= gap_pos && ext_i < gap_pos + gap_size {
             lines.push(Line::from(""));
@@ -574,7 +593,7 @@ fn draw_body(f: &mut Frame, area: Rect, state: &AppState) {
         let fl = &state.flat[i];
         let line = match fl.kind {
             FlatKind::FileHeader => render_file_header(state, fl.file_idx, width),
-            FlatKind::FileFooter => render_file_footer(state, fl.file_idx, width),
+            FlatKind::FileFooter => render_file_footer(width),
             FlatKind::HunkHeader => {
                 render_hunk_header(state, fl.file_idx, fl.hunk_idx.unwrap(), width)
             }
@@ -1025,8 +1044,7 @@ fn render_file_header(state: &AppState, fi: usize, width: usize) -> Line<'static
     Line::from(spans)
 }
 
-/// The " ✓ viewed " / " ☐ viewed " toggle drawn in the same columns on a
-/// file's header and footer, so one click handler serves both.
+/// The " ✓ viewed " / " ☐ viewed " toggle at the right of a file header.
 fn viewed_badge(viewed: bool, base: Style) -> (&'static str, Style) {
     if viewed {
         (
@@ -1038,29 +1056,12 @@ fn viewed_badge(viewed: bool, base: Style) -> (&'static str, Style) {
     }
 }
 
-fn render_file_footer(state: &AppState, fi: usize, width: usize) -> Line<'static> {
+fn render_file_footer(width: usize) -> Line<'static> {
     let border = Style::default().fg(BORDER_FG);
     let inner_w = width.saturating_sub(2);
-    // A collapsed file's footer sits right under its header, which already
-    // carries the toggle; only repeat it at the bottom of an open file.
-    let expanded = state.expanded.get(fi).copied().unwrap_or(true);
-    if !expanded {
-        return Line::from(vec![
-            Span::styled("╰".to_string(), border),
-            Span::styled("─".repeat(inner_w), border),
-            Span::styled("╯".to_string(), border),
-        ]);
-    }
-    let viewed = state
-        .files
-        .get(fi)
-        .is_some_and(|f| state.viewed.contains_key(&f.path));
-    let (badge, badge_style) = viewed_badge(viewed, Style::default());
-    let rule = inner_w.saturating_sub(badge.chars().count());
     Line::from(vec![
         Span::styled("╰".to_string(), border),
-        Span::styled("─".repeat(rule), border),
-        Span::styled(badge.to_string(), badge_style),
+        Span::styled("─".repeat(inner_w), border),
         Span::styled("╯".to_string(), border),
     ])
 }

@@ -395,6 +395,9 @@ pub struct AppState {
     pub picker: Option<FuzzyPicker>,
     pub body_x: u16,
     pub body_width: u16,
+    /// File whose header is pinned over the diff's top row this frame (its
+    /// real header has scrolled off). Set by ui::draw; read by mouse hits.
+    pub sticky_file: Option<usize>,
     // Dynamic composer popup height (rows, includes borders). Set by ui::draw
     // each frame based on the TextArea's content. 0 when not composing.
     pub composer_height: u16,
@@ -507,6 +510,7 @@ impl AppState {
             picker: None,
             body_x: 0,
             body_width: 80,
+            sticky_file: None,
             composer_height: 0,
             editing_thread_idx: None,
             composer_target: None,
@@ -1263,6 +1267,28 @@ impl AppState {
         } else if self.cursor >= self.scroll + vh {
             self.scroll = self.cursor + 1 - vh;
         }
+        // The top row is covered by the sticky header; nudge up one row so the
+        // cursor isn't hidden beneath it.
+        if self.cursor == self.scroll
+            && self.scroll > 0
+            && self.sticky_file_at(self.scroll).is_some()
+        {
+            self.scroll -= 1;
+        }
+    }
+
+    /// The open file whose header should be pinned when flat row `top` is the
+    /// first visible row: any row inside a file other than its own header.
+    pub fn sticky_file_at(&self, top: usize) -> Option<usize> {
+        let fl = self.flat.get(top)?;
+        if matches!(fl.kind, FlatKind::FileHeader | FlatKind::Spacer) {
+            return None;
+        }
+        self.expanded
+            .get(fl.file_idx)
+            .copied()
+            .unwrap_or(true)
+            .then_some(fl.file_idx)
     }
 
     pub fn scroll_by(&mut self, delta: i32) {

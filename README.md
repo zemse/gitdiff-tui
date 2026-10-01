@@ -16,8 +16,9 @@ in a format a coding agent (or another human) can act on directly.
 - Unified diff view with syntax highlighting (via `syntect`) and intra-line
   word-level emphasis.
 - File tree sidebar (`e`), fuzzy file picker (`t`), per-file "viewed"
-  checkmark (`v`, or click it at the top or bottom of a file) that persists
-  across runs.
+  checkmark (`v`, or click it in the file header) that persists across runs.
+- Sticky file header: scrolled into a file, its name and viewed toggle stay
+  pinned at the top.
 - Per-file and per-hunk collapse/expand, with `expand 20 above`/`below` buttons
   to load more file context lazily.
 - Inline comments with a yellow-bordered composer: click a line (or press `c`)
