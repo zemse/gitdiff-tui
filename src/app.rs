@@ -883,18 +883,6 @@ impl AppState {
         }
     }
 
-    /// Combined gap remaining between hunk `hi` and the next hunk. Returns None
-    /// if `hi` is the last hunk in the file.
-    pub fn inter_hunk_remaining(&self, fi: usize, hi: usize) -> Option<usize> {
-        let file = self.files.get(fi)?;
-        if hi + 1 >= file.hunks.len() {
-            return None;
-        }
-        let lower = self.below_frontier_new(fi, hi);
-        let upper = self.above_frontier_new(fi, hi + 1);
-        Some(upper.saturating_sub(lower + 1))
-    }
-
     /// Expand hunk `hi` in the given direction by up to `count` lines, sourced
     /// from `lines` (new-side file content). Returns the number actually added.
     pub fn expand_hunk(
