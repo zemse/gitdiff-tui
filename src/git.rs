@@ -218,12 +218,7 @@ pub fn get_diff(root: &Path, source: &DiffSource, opts: &DiffOpts) -> Result<Str
         DiffSource::WorkingTree => {
             let mut args = base_args;
             args.push("HEAD");
-            let mut out = run(&args, Some(root))?;
-            // `git diff HEAD` only covers tracked files. Append each untracked
-            // file as a synthetic new-file diff so they show up alongside the
-            // staged/unstaged changes.
-            out.push_str(&untracked_diff(root, opts)?);
-            out
+            working_tree_diff(root, &args)?
         }
         DiffSource::Branch { base, head } => {
             let range = format!("{}..{head}", merge_base(root, base, head));
@@ -329,36 +324,107 @@ fn split_file_blocks(raw: &str) -> Vec<&str> {
         .collect()
 }
 
-/// Produce concatenated "new file" diffs for every untracked file, using
-/// `git diff --no-index /dev/null <path>`. The output is the same format git
-/// emits for a newly added tracked file, so the diff parser treats each as an
-/// `Added` file without any special-casing.
-fn untracked_diff(root: &Path, opts: &DiffOpts) -> Result<String> {
-    let ctx = format!("-U{}", opts.context_lines);
-    let mut out = String::new();
+/// `git diff HEAD` plus every untracked file. `git diff HEAD` only covers
+/// tracked files, so untracked ones are marked intent-to-add (`git add -N`)
+/// in a throwaway copy of the index and the diff runs against that. They then
+/// show up as ordinary new files, and rename/copy detection treats them
+/// exactly as it would in a commit. The real index is never touched.
+fn working_tree_diff(root: &Path, args: &[&str]) -> Result<String> {
+    let mut intent: Vec<String> = Vec::new();
+    let mut stubs = String::new();
     for path in list_untracked(root)? {
         // Skip reading/diffing brand-new files above the size cap. A large
         // untracked blob (multi-MB JSON dumps, logs, build artifacts) would
         // otherwise be read into memory, parsed, and syntax-highlighted line
         // by line at startup — enough to freeze the TUI for minutes. Emit a
         // stub the parser turns into an `omitted` placeholder instead.
-        if let Ok(meta) = std::fs::metadata(root.join(&path)) {
-            if meta.is_file() && meta.len() > MAX_UNTRACKED_RENDER_BYTES {
-                out.push_str(&omitted_stub(&path, meta.len()));
-                continue;
+        match std::fs::symlink_metadata(root.join(&path)) {
+            Ok(meta) if meta.is_file() && meta.len() > MAX_UNTRACKED_RENDER_BYTES => {
+                stubs.push_str(&omitted_stub(&path, meta.len()));
             }
-        }
-        let mut args: Vec<&str> = vec!["diff", "--no-color", "--no-ext-diff", &ctx, "--no-index"];
-        if opts.ignore_whitespace {
-            args.push("-w");
-        }
-        // `--` guards against paths that begin with a dash.
-        args.extend(["--", "/dev/null", &path]);
-        if let Some(d) = run_no_index(&args, root)? {
-            out.push_str(&d);
+            // Directories here are nested repos; adding them would record a
+            // gitlink, so leave them out like `git diff` itself does.
+            Ok(meta) if meta.is_dir() => {}
+            Ok(_) => intent.push(path),
+            Err(_) => {}
         }
     }
+    let mut out = if intent.is_empty() {
+        run(args, Some(root))?
+    } else {
+        let index = TempIndex::new(root)?;
+        let mut list = intent.join("\0");
+        list.push('\0');
+        index.run(
+            &[
+                "add",
+                "--intent-to-add",
+                "--pathspec-from-file=-",
+                "--pathspec-file-nul",
+            ],
+            Some(&list),
+        )?;
+        index.run(args, None)?
+    };
+    out.push_str(&stubs);
     Ok(out)
+}
+
+/// A private copy of the repo's index, deleted on drop. Per-process name so a
+/// TUI poll and a concurrent CLI call never share one.
+struct TempIndex<'a> {
+    root: &'a Path,
+    path: PathBuf,
+}
+
+impl<'a> TempIndex<'a> {
+    fn new(root: &'a Path) -> Result<Self> {
+        let git_path = |p: &str| -> Result<PathBuf> {
+            let out = run(&["rev-parse", "--git-path", p], Some(root))?;
+            Ok(root.join(out.trim()))
+        };
+        let real = git_path("index")?;
+        let path = git_path(&format!("gitdiff-index-{}", std::process::id()))?;
+        if real.exists() {
+            std::fs::copy(&real, &path)
+                .with_context(|| format!("failed to copy index to {}", path.display()))?;
+        }
+        Ok(Self { root, path })
+    }
+
+    fn run(&self, args: &[&str], stdin: Option<&str>) -> Result<String> {
+        use std::io::Write;
+        use std::process::Stdio;
+        let mut child = Command::new("git")
+            .args(args)
+            .current_dir(self.root)
+            .env("GIT_INDEX_FILE", &self.path)
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .with_context(|| format!("failed to invoke `git {}`", args.join(" ")))?;
+        let mut pipe = child.stdin.take().expect("stdin is piped");
+        if let Some(input) = stdin {
+            pipe.write_all(input.as_bytes())?;
+        }
+        drop(pipe);
+        let out = child.wait_with_output()?;
+        if !out.status.success() {
+            return Err(anyhow!(
+                "git {} failed: {}",
+                args.join(" "),
+                String::from_utf8_lossy(&out.stderr).trim()
+            ));
+        }
+        String::from_utf8(out.stdout).context("git output not utf-8")
+    }
+}
+
+impl Drop for TempIndex<'_> {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_file(&self.path);
+    }
 }
 
 /// Untracked files larger than this are shown as a collapsed "not rendered"

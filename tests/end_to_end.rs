@@ -134,6 +134,64 @@ fn large_untracked_file_is_omitted_not_ingested() {
 }
 
 #[test]
+fn untracked_copy_detected_like_a_commit() {
+    let tmp = tempdir_in_target("gitdiff_e2e_untracked_copy");
+    git(&tmp, &["init", "-q", "-b", "main"]);
+    git(&tmp, &["config", "user.email", "t@t"]);
+    git(&tmp, &["config", "user.name", "t"]);
+
+    let body: String = (1..=40).map(|i| format!("line {i}\n")).collect();
+    fs::write(tmp.join("orig.rs"), format!("include old;\n{body}")).unwrap();
+    fs::write(tmp.join("other.rs"), "unrelated\n".repeat(40)).unwrap();
+    git(&tmp, &["add", "."]);
+    git(&tmp, &["commit", "-q", "-m", "init"]);
+
+    // Untracked clone with one changed line, plus an untracked file only a
+    // `--copy-source` hint can pair with its source.
+    fs::write(tmp.join("clone.rs"), format!("include new;\n{body}")).unwrap();
+    fs::write(tmp.join("hinted.rs"), "something else\n").unwrap();
+
+    let out = Command::new(env!("CARGO_BIN_EXE_gitdiff"))
+        .args([
+            "diff",
+            "--find-copies-harder",
+            "--copy-source",
+            "hinted.rs=other.rs",
+        ])
+        .current_dir(&tmp)
+        .output()
+        .expect("run gitdiff diff");
+    assert!(
+        out.status.success(),
+        "gitdiff diff failed: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let raw = String::from_utf8(out.stdout).unwrap();
+    assert!(
+        raw.contains("copy from orig.rs\ncopy to clone.rs")
+            && raw.contains("-include old;\n+include new;\n")
+            && !raw.contains("+line 1\n"),
+        "untracked clone not detected as a copy:\n{raw}"
+    );
+    assert!(
+        raw.contains("copy from other.rs\ncopy to hinted.rs"),
+        "--copy-source hint not applied:\n{raw}"
+    );
+
+    // The real index is untouched: both files are still untracked.
+    let status = Command::new("git")
+        .args(["status", "--porcelain"])
+        .current_dir(&tmp)
+        .output()
+        .unwrap();
+    let status = String::from_utf8(status.stdout).unwrap();
+    assert!(
+        status.contains("?? clone.rs") && status.contains("?? hinted.rs"),
+        "index was modified:\n{status}"
+    );
+}
+
+#[test]
 fn branch_diff_against_upstream() {
     let tmp = tempdir_in_target("gitdiff_e2e_br");
     git(&tmp, &["init", "-q", "-b", "main"]);

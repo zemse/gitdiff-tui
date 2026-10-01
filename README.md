@@ -72,9 +72,8 @@ gitdiff base..head --find-copies=20            # copies only, custom threshold (
 gitdiff base..head --copy-source dst=src       # pin the source when detection misses (repeatable)
 ```
 
-Comments stay anchored to the destination file. For the working tree,
-untracked files are not copy candidates; `git add -N` them first, or use
-`--copy-source`.
+Comments stay anchored to the destination file. Working-tree reviews detect
+copies the same way, including in untracked files.
 
 ## CLI subcommands (for agents and scripting)
 
