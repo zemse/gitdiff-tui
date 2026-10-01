@@ -738,15 +738,18 @@ fn handle_mouse(
             let Some(idx) = row_to_idx(m.row) else { return };
             let fl = state.flat[idx].clone();
             match fl.kind {
-                FlatKind::FileHeader => {
+                FlatKind::FileHeader | FlatKind::FileFooter => {
                     state.cursor = idx;
                     state.clear_selection();
                     // Right-aligned " ✓ viewed " / " ☐ viewed " badge is 10
-                    // chars wide; the closing `╮` is the very last column.
+                    // chars wide; the closing `╮`/`╯` is the very last column.
+                    // A collapsed file's footer has no badge.
                     let rel_col = m.column.saturating_sub(state.body_x);
                     let badge_start = state.body_width.saturating_sub(11);
                     let badge_end = state.body_width.saturating_sub(1);
-                    if rel_col >= badge_start && rel_col < badge_end {
+                    let has_badge = fl.kind == FlatKind::FileHeader
+                        || state.expanded.get(fl.file_idx).copied().unwrap_or(true);
+                    if has_badge && rel_col >= badge_start && rel_col < badge_end {
                         if let Some(now) = state.toggle_viewed(fl.file_idx) {
                             state.status = Some(if now {
                                 "marked viewed (collapsed)".into()
@@ -757,11 +760,6 @@ fn handle_mouse(
                     } else {
                         state.toggle_collapse(fl.file_idx);
                     }
-                }
-                FlatKind::FileFooter => {
-                    state.cursor = idx;
-                    state.clear_selection();
-                    state.toggle_collapse(fl.file_idx);
                 }
                 FlatKind::HunkHeader => {
                     state.cursor = idx;

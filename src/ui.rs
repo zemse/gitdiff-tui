@@ -574,7 +574,7 @@ fn draw_body(f: &mut Frame, area: Rect, state: &AppState) {
         let fl = &state.flat[i];
         let line = match fl.kind {
             FlatKind::FileHeader => render_file_header(state, fl.file_idx, width),
-            FlatKind::FileFooter => render_file_footer(width),
+            FlatKind::FileFooter => render_file_footer(state, fl.file_idx, width),
             FlatKind::HunkHeader => {
                 render_hunk_header(state, fl.file_idx, fl.hunk_idx.unwrap(), width)
             }
@@ -1015,17 +1015,7 @@ fn render_file_header(state: &AppState, fi: usize, width: usize) -> Line<'static
     }
 
     // right-aligned "viewed" indicator: pad first, then the badge
-    let viewed_badge = if viewed {
-        " ✓ viewed "
-    } else {
-        " ☐ viewed "
-    };
-    let viewed_style = if viewed {
-        bg.fg(Color::Green).add_modifier(Modifier::BOLD)
-    } else {
-        bg.fg(Color::DarkGray)
-    };
-
+    let (viewed_badge, viewed_style) = viewed_badge(viewed, bg);
     let used = visible_width(&spans);
     let badge_w = viewed_badge.chars().count();
     let pad = width.saturating_sub(used + badge_w + 1);
@@ -1035,12 +1025,42 @@ fn render_file_header(state: &AppState, fi: usize, width: usize) -> Line<'static
     Line::from(spans)
 }
 
-fn render_file_footer(width: usize) -> Line<'static> {
+/// The " ✓ viewed " / " ☐ viewed " toggle drawn in the same columns on a
+/// file's header and footer, so one click handler serves both.
+fn viewed_badge(viewed: bool, base: Style) -> (&'static str, Style) {
+    if viewed {
+        (
+            " ✓ viewed ",
+            base.fg(Color::Green).add_modifier(Modifier::BOLD),
+        )
+    } else {
+        (" ☐ viewed ", base.fg(Color::DarkGray))
+    }
+}
+
+fn render_file_footer(state: &AppState, fi: usize, width: usize) -> Line<'static> {
     let border = Style::default().fg(BORDER_FG);
     let inner_w = width.saturating_sub(2);
+    // A collapsed file's footer sits right under its header, which already
+    // carries the toggle; only repeat it at the bottom of an open file.
+    let expanded = state.expanded.get(fi).copied().unwrap_or(true);
+    if !expanded {
+        return Line::from(vec![
+            Span::styled("╰".to_string(), border),
+            Span::styled("─".repeat(inner_w), border),
+            Span::styled("╯".to_string(), border),
+        ]);
+    }
+    let viewed = state
+        .files
+        .get(fi)
+        .is_some_and(|f| state.viewed.contains_key(&f.path));
+    let (badge, badge_style) = viewed_badge(viewed, Style::default());
+    let rule = inner_w.saturating_sub(badge.chars().count());
     Line::from(vec![
         Span::styled("╰".to_string(), border),
-        Span::styled("─".repeat(inner_w), border),
+        Span::styled("─".repeat(rule), border),
+        Span::styled(badge.to_string(), badge_style),
         Span::styled("╯".to_string(), border),
     ])
 }

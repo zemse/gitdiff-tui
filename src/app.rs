@@ -798,6 +798,20 @@ impl AppState {
             *e = !now_viewed; // viewed → collapsed
         }
         self.rebuild_flat();
+        // Land on the file's header. When it was toggled from the footer with
+        // the header scrolled off the top, pin the header to the top so the
+        // next file follows directly below instead of jumping elsewhere.
+        if let Some(h) = self
+            .flat
+            .iter()
+            .position(|fl| fl.file_idx == file_idx && fl.kind == FlatKind::FileHeader)
+        {
+            self.cursor = h;
+            if h < self.scroll {
+                self.scroll = h;
+                self.clamp_scroll();
+            }
+        }
         self.cursor = self.cursor.min(self.flat.len().saturating_sub(1));
         self.ensure_cursor_visible();
         Some(now_viewed)
