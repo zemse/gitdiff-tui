@@ -100,6 +100,13 @@ fn canonicalize_head(root: &Path, head: &str) -> String {
 }
 
 fn parse_range(s: &str) -> Result<(String, String)> {
+    // A bare 1-3 digit "range" can't be a rev (git needs 4+ hex chars for a
+    // short sha); it's almost certainly `--find-copies 20` missing its `=`.
+    if !s.is_empty() && s.len() <= 3 && s.chars().all(|c| c.is_ascii_digit()) {
+        return Err(anyhow!(
+            "'{s}' is not a revision range; for a copy threshold write `--find-copies={s}` (the `=` is required)"
+        ));
+    }
     if let Some((b, h)) = s.split_once("..") {
         Ok((b.to_string(), h.to_string()))
     } else {

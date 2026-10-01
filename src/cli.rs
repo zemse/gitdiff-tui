@@ -44,6 +44,7 @@ pub struct Cli {
 #[derive(Subcommand, Debug)]
 pub enum Commands {
     /// Print the unified diff to stdout.
+    #[command(after_help = COPY_EXAMPLES)]
     Diff {
         /// Optional `<base>..<head>` range; auto-detected if absent.
         range: Option<String>,
@@ -81,6 +82,7 @@ pub enum Commands {
     },
 
     /// Add a new comment thread anchored at `<file>:<line>`.
+    #[command(after_help = COPY_EXAMPLES)]
     Comment {
         /// File path (repo-relative).
         file: String,
@@ -193,9 +195,16 @@ pub enum Commands {
 /// Copy detection, so a new file adapted from an existing one diffs against
 /// its source instead of showing every line as added. Off unless requested.
 #[derive(Args, Debug, Clone, Default)]
+#[command(
+    next_help_heading = "Copy detection (review a new file against the file it was copied from)"
+)]
 pub struct CopyArgs {
-    /// Detect copies, with an optional similarity threshold in percent
-    /// (default 50). Passes `-C<n>%` to git diff.
+    /// Detect copied files; optional similarity threshold, e.g. `--find-copies=20`.
+    ///
+    /// A new file that is at least PERCENT similar (default 50) to a file
+    /// changed in the same diff is shown as `C <pct>% src → dst` with only
+    /// the differing lines. The `=` is required: `--find-copies 20` would
+    /// read `20` as the range. Lower the threshold for heavily edited copies.
     #[arg(
         long = "find-copies",
         value_name = "PERCENT",
@@ -205,15 +214,40 @@ pub struct CopyArgs {
         value_parser = clap::value_parser!(u8).range(0..=100)
     )]
     find_copies: Option<u8>,
-    /// Also consider unchanged files as copy sources. Implies
-    /// `--find-copies`. Slower on large repos.
+    /// Also match copies of files that did not change (the usual case).
+    ///
+    /// Without this, git only treats files modified in the same diff as
+    /// possible sources, so a copy of an untouched file shows as 100% added.
+    /// Implies `--find-copies`. Slower on very large repos.
     #[arg(long = "find-copies-harder")]
     find_copies_harder: bool,
-    /// Diff `<DST>` against `<SRC>` as a copy, overriding copy detection.
-    /// Repeatable. Comments stay anchored to `<DST>`.
+    /// Name the source of a copied file yourself: `--copy-source new=original`.
+    ///
+    /// Use when detection misses a copy or picks the wrong source. DST is the
+    /// new file under review, SRC the existing file it came from. Repeatable,
+    /// one per file. Works with or without the other copy flags. Comments
+    /// stay anchored to DST.
     #[arg(long = "copy-source", value_name = "DST=SRC", value_parser = parse_copy_source)]
     copy_source: Vec<(String, String)>,
 }
+
+/// Worked examples appended to `--help` wherever the copy flags are accepted.
+const COPY_EXAMPLES: &str = "\
+REVIEWING COPIED FILES
+    A file copied from an existing one and then edited normally shows as
+    entirely new. These show it as a copy, diffed against the original:
+
+    gitdiff base..head --find-copies-harder
+        Detect copies, including of files the change did not touch.
+    gitdiff base..head --find-copies-harder --find-copies=20
+        Same, but also catch heavily edited copies (>= 20% similar).
+    gitdiff --copy-source exp/core.circom=circuits/core.circom
+        Pin the source by hand when detection misses it (repeatable).
+
+    Works the same for the working tree (untracked files included) and for
+    commit ranges. Pass the same flags to `gitdiff diff` and
+    `gitdiff comment` so agents see the same lines you do.
+";
 
 impl CopyArgs {
     pub fn apply(&self, opts: &mut DiffOpts) {
@@ -897,6 +931,8 @@ fn emit_event(
 fn build_default_diff_trailer() -> String {
     use std::fmt::Write;
     let mut s = String::new();
+    s.push_str(COPY_EXAMPLES);
+    s.push('\n');
     s.push_str("DEFAULT DIFF (auto-detected from current working dir)\n");
     match git::repo_root() {
         Err(e) => {
